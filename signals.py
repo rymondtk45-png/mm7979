@@ -1,8 +1,6 @@
 """
 signals.py
-
 Module score + luat HTF veto + composite + ranking.
-
 Moi module tra ve signed float trong [-1, 1]: duong = nghieng long, am = nghieng short,
 do lon = do tin cay module do. Composite = sum(module_score * weight), sau do chuan hoa 0-100.
 """
@@ -38,7 +36,6 @@ def classify_entry(f: dict, result: dict, weights: Dict[str, float]) -> dict:
     huong tin hieu cuoi cung) cua nhom MOMENTUM vs nhom STRUCTURE+MEAN-REVERSION.
     Regime va spoof_score dieu chinh nhe theo boi canh (high_volatility day ve
     MARKET, accumulation/spoof nghi ngo day ve LIMIT).
-
     Tra ve dict: entry_type (MARKET/LIMIT), entry_price, reason.
     """
     direction = result.get("direction", "neutral")
@@ -48,6 +45,7 @@ def classify_entry(f: dict, result: dict, weights: Dict[str, float]) -> dict:
 
     sign = 1.0 if direction == "long" else -1.0
     module_scores = result.get("module_scores", {})
+
     momentum_contrib = 0.0
     structure_contrib = 0.0
     for name, raw in module_scores.items():
@@ -268,6 +266,7 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
     reasons(list[str]), veto(bool), veto_reason(str), module_scores(dict).
     """
     reasons: List[str] = []
+
     allowed, htf_reason = htf_check(f.get("bias_15m", "neutral"), f.get("bias_1h", "neutral"),
                                      f.get("bias_4h", "neutral"), cfg)
     reasons.append(htf_reason)
@@ -279,12 +278,12 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
         }
 
     active_modules = LEGACY_MODULES if not cfg.enable_market_intel_scoring else list(weights.keys())
+
     module_scores: Dict[str, float] = {}
     total = 0.0
     max_possible = 0.0
     votes_long = 0
     votes_short = 0
-
     for name in active_modules:
         if name not in weights:
             continue
@@ -301,11 +300,18 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
         elif raw < -0.05:
             votes_short += 1
 
-    active_opinions = votes_long + votes_short
-    vote_spread = abs(votes_long - votes_short)
-    if active_opinions < 4 or vote_spread < 3:
+    # Dong thuan module (siet chat theo README muc 6.5): can >=4 module co y
+    # kien (raw > 0.05 hoac < -0.05) VA chenh lech phieu long/short >= 3, neu
+    # khong se veto "weak consensus". Truoc day chi yeu cau chenh lech > 1 va
+    # khong doi hoi so luong module toi thieu -> lot nhieu tin hieu "mong
+    # manh" (2-3 module manh la du dat diem cao), day la nguyen nhan chinh
+    # khien SL bi dinh nhieu. Ap dung dung nhu README da cong bo.
+    total_votes = votes_long + votes_short
+    vote_diff = abs(votes_long - votes_short)
+    if total_votes < cfg.min_consensus_modules or vote_diff < cfg.min_consensus_vote_diff:
         reasons.append(
-            f"veto: weak consensus ({active_opinions} module co y kien, chenh lech {vote_spread})"
+            f"veto: weak consensus (module co y kien={total_votes}/{cfg.min_consensus_modules}, "
+            f"chenh lech phieu={vote_diff}/{cfg.min_consensus_vote_diff})"
         )
         return {
             "score": 0.0, "direction": "neutral", "confidence": 0.0,
@@ -315,54 +321,17 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
 
     direction = "long" if total > 0 else ("short" if total < 0 else "neutral")
 
-    # ---- multiplier tong hop (4h align, spoof) — giu nguyen y nghia cu,
-    # chi gom lai thanh 1 he so de ap dung thong nhat len magnitude ben duoi ----
-    multiplier = 1.0
     if f.get("bias_4h") != "neutral" and f.get("bias_4h") == direction:
-        multiplier *= 1.15
+        total *= 1.15
         reasons.append("4h aligned x1.15")
+
     spoof_score = f.get("spoof_score", 0.0)
     if spoof_score > 0.6:
-        multiplier *= 0.75
+        total *= 0.75
         reasons.append(f"spoof_score {spoof_score:.2f} > 0.6 -> x0.75")
 
-    # ============================================================
-    # CONG THUC MOI: score = consensus * sqrt(breadth) * 100
-    #
-    # consensus = trong cac module DANG LEN TIENG (|raw| > 0.05), chung
-    #             dong thuan huong voi nhau bao nhieu (0 = doi dau nhau
-    #             hoan toan, 1 = tat ca cung chieu). Day la ban chat
-    #             "confidence" that su cua tin hieu.
-    #
-    # breadth   = trong so cua cac module dang len tieng chiem bao nhieu
-    #             % tong trong so cua TOAN BO module dang active. Dung
-    #             sqrt() de breadth thap khong lam sap diem qua nhanh
-    #             (2/12 module manh van co the ra tin hieu dang tin,
-    #             chi la thap hon 8/12 module manh, khong bi ep ve gan 0).
-    #
-    # Ca hai bi chan trong [0,1] truoc khi nhan, nen thang 0-100 va y
-    # nghia THRESHOLD KHONG DOI — chi la mau so cong bang hon, khong con
-    # bi pha loang phi ly boi cac module dang im lang (khac ban cu: score
-    # = |total| / tong_weight_12_module, luon chia cho 9.6 bat ke may
-    # module thuc su len tieng).
-    # ============================================================
-    fired_contribs = []
-    fired_weight = 0.0
-    for name, raw in module_scores.items():
-        if abs(raw) <= 0.05:
-            continue
-        w = weights.get(name, 0.0)
-        fired_contribs.append(raw * w)
-        fired_weight += w
-
-    sum_abs_fired = sum(abs(c) for c in fired_contribs)
-    consensus = (abs(sum(fired_contribs)) / sum_abs_fired) if sum_abs_fired else 0.0
-    breadth = (fired_weight / max_possible) if max_possible else 0.0
-
-    magnitude = consensus * (breadth ** 0.5) * multiplier
-    magnitude = max(0.0, min(1.0, magnitude))  # ve lai [0,1] truoc khi *100
-
-    score = magnitude * 100.0
+    magnitude = abs(total) / max_possible if max_possible else 0.0
+    score = max(0.0, min(100.0, magnitude * 100.0))
     confidence = magnitude
 
     if direction == "neutral" or score == 0.0:
@@ -384,16 +353,11 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
 
 
 def suggested_sl_tp(entry: float, direction: str, atr15m: float) -> Tuple[float, float]:
-    """SL/TP tu ATR15m.
-    SL = 1.3*ATR (tang nhe tu 1.2x - khong qua gan de tranh bi quet boi nhieu
-    ngan han, khong qua xa lam risk moi lenh phinh to bat hop ly).
-    TP = 3.0*ATR (tang tu 2.4x -> R:R = 2.3 thay vi 2.0) - cho lenh thang
-    nhieu khong gian chay hon, phu hop entry da duoc loc ky (>=4 module dong
-    thuan + HTF align) thay vi chot qua som."""
+    """SL/TP tu ATR15m: SL = 0.8*ATR, TP = 1.5*ATR."""
     if direction == "long":
-        return entry - 1.3 * atr15m, entry + 3.0 * atr15m
+        return entry - 0.8 * atr15m, entry + 1.5 * atr15m
     if direction == "short":
-        return entry + 1.3 * atr15m, entry - 3.0 * atr15m
+        return entry + 0.8 * atr15m, entry - 1.5 * atr15m
     return entry, entry
 
 

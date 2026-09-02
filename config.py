@@ -56,39 +56,29 @@ def _get_list(name: str, default: List[str]) -> List[str]:
 class AppConfig:
     telegram_bot_token: str = field(default_factory=lambda: os.getenv("TELEGRAM_BOT_TOKEN", ""))
     telegram_chat_id: str = field(default_factory=lambda: os.getenv("TELEGRAM_CHAT_ID", ""))
-
     core_symbols: List[str] = field(default_factory=lambda: _get_list(
         "CORE_SYMBOLS", ["BTCUSDT", "ETHUSDT", "SOLUSDT"]))
     contract_type: str = field(default_factory=lambda: os.getenv("CONTRACT_TYPE", "PERPETUAL"))
     quote_asset: str = field(default_factory=lambda: os.getenv("QUOTE_ASSET", "USDT"))
-
     coinstrong_default: bool = field(default_factory=lambda: _get_bool("COINSTRONG", False))
     scan_limit_off: int = field(default_factory=lambda: _get_int("SCAN_LIMIT_OFF", 25))
     scan_limit_on: int = field(default_factory=lambda: _get_int("SCAN_LIMIT_ON", 200))
     min_quote_volume: float = field(default_factory=lambda: _get_float("MIN_QUOTE_VOLUME", 20_000_000))
     min_hot_change_pct: float = field(default_factory=lambda: _get_float("MIN_HOT_CHANGE_PCT", 3.0))
     universe_refresh_seconds: int = field(default_factory=lambda: _get_int("UNIVERSE_REFRESH_SECONDS", 60))
-
     exchanges: List[str] = field(default_factory=lambda: _get_list(
         "EXCHANGES", ["BINANCE", "OKX", "BYBIT", "BINGX", "KUCOIN", "BITGET", "MEXC"]))
 
     # --- Full-model-for-all-pairs ---
     full_data_all: bool = field(default_factory=lambda: _get_bool("FULL_DATA_ALL", True))
     cross_exchange_all: bool = field(default_factory=lambda: _get_bool("CROSS_EXCHANGE_ALL", False))
-    # Cache + timeout + so worker song song danh rieng cho cross-exchange, tach
-    # biet voi WEIGHT_LIMITER cua Binance de khong bop toc do goi Binance khi
-    # bat cross-exchange cho toan bo scan set (co the 100-200+ cap).
-    cross_exchange_cache_seconds: int = field(
-        default_factory=lambda: _get_int("CROSS_EXCHANGE_CACHE_SECONDS", 45))
-    cross_exchange_timeout: float = field(
-        default_factory=lambda: _get_float("CROSS_EXCHANGE_TIMEOUT", 3.0))
-    cross_exchange_workers: int = field(
-        default_factory=lambda: _get_int("CROSS_EXCHANGE_WORKERS", 6))
     ws_cover_all: bool = field(default_factory=lambda: _get_bool("WS_COVER_ALL", True))
     ws_chunk_size: int = field(default_factory=lambda: _get_int("WS_CHUNK_SIZE", 40))
     max_workers: int = field(default_factory=lambda: _get_int("MAX_WORKERS", 12))
+
     # Ngan sach weight/phut, de duoi gioi han that cua Binance Futures (2400/phut/IP)
     weight_budget_per_min: int = field(default_factory=lambda: _get_int("WEIGHT_BUDGET_PER_MIN", 2000))
+
     funding_cache_seconds: int = field(default_factory=lambda: _get_int("FUNDING_CACHE_SECONDS", 120))
     oi_cache_seconds: int = field(default_factory=lambda: _get_int("OI_CACHE_SECONDS", 60))
     lsr_cache_seconds: int = field(default_factory=lambda: _get_int("LSR_CACHE_SECONDS", 120))
@@ -103,13 +93,18 @@ class AppConfig:
     enable_market_intel_scoring: bool = field(
         default_factory=lambda: _get_bool("ENABLE_MARKET_INTEL_SCORING", True))
 
+    # --- Luat dong thuan module (README muc 6.5): can >=N module co y kien
+    # VA chenh lech phieu long/short >=M moi khong bi veto "weak consensus".
+    # Mac dinh dung theo README (4 module, chenh lech 3) - co the chinh qua
+    # bien moi truong neu muon long/chat hon.
+    min_consensus_modules: int = field(default_factory=lambda: _get_int("MIN_CONSENSUS_MODULES", 4))
+    min_consensus_vote_diff: int = field(default_factory=lambda: _get_int("MIN_CONSENSUS_VOTE_DIFF", 3))
+
     min_tf: str = field(default_factory=lambda: os.getenv("MIN_TF", "15m"))
     require_1h_align: bool = field(default_factory=lambda: _get_bool("REQUIRE_1H_ALIGN", True))
     require_4h_align: bool = field(default_factory=lambda: _get_bool("REQUIRE_4H_ALIGN", True))
-
     log_path: str = field(default_factory=lambda: os.getenv("LOG_PATH", "logs/signals.jsonl"))
     feature_log_path: str = field(default_factory=lambda: os.getenv("FEATURE_LOG_PATH", "logs/features.jsonl"))
-
     depth_levels: int = field(default_factory=lambda: _get_int("DEPTH_LEVELS", 20))
     tape_window_seconds: int = field(default_factory=lambda: _get_int("TAPE_WINDOW_SECONDS", 14400))
     large_print_quantile: float = field(default_factory=lambda: _get_float("LARGE_PRINT_QUANTILE", 0.995))
