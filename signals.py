@@ -294,11 +294,18 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
         module_scores[name] = raw
         w = weights[name]
         total += raw * w
-        max_possible += w
+        # CHI cong trong so vao mau so cho MODULE THUC SU CO Y KIEN (|raw|>0.05).
+        # Truoc day cong ca 12 module du im lang (raw=0) -> mau so luon co dinh
+        # bang tong trong so toan bo model, nen khi doi hoi nhieu module dong
+        # thuan hon (luat consensus), diem bi "pha loang" du chat luong tin
+        # hieu khong doi. Gio mau so co gian theo dung so module dang len
+        # tieng, giu thang diem gan 0-100 nhu thiet ke ban dau.
         if raw > 0.05:
             votes_long += 1
+            max_possible += w
         elif raw < -0.05:
             votes_short += 1
+            max_possible += w
 
     # Dong thuan module (siet chat theo README muc 6.5): can >=4 module co y
     # kien (raw > 0.05 hoac < -0.05) VA chenh lech phieu long/short >= 3, neu
