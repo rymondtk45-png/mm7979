@@ -11,8 +11,8 @@ from __future__ import annotations
 import signal
 import sys
 
-from src.app import SignalEngine
-from src.config import AppConfig, get_logger
+from app import SignalEngine
+from config import AppConfig, get_logger
 
 log = get_logger("main")
 

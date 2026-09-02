@@ -11,9 +11,9 @@ from typing import Dict, List, Optional
 
 import requests
 
-from .config import AppConfig, append_jsonl, get_logger, load_weights
-from .data import MarketContext, UniverseManager, build_features
-from .signals import compute_composite, rank_top, suggested_sl_tp
+from config import AppConfig, append_jsonl, get_logger, load_weights
+from data import MarketContext, UniverseManager, build_features
+from signals import compute_composite, rank_top, suggested_sl_tp
 
 log = get_logger("app")
 

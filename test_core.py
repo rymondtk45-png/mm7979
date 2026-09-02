@@ -4,16 +4,13 @@ Unit test cho cac ham thuan (khong I/O) trong src/data.py va src/signals.py.
 Chay: python -m unittest tests.test_core -v   (tu thu muc goc bot_mm_fund)
 """
 import os
-import sys
 import unittest
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
-from src.data import (  # noqa: E402
+from data import (
     compute_cvd, compute_imbalance, compute_volume_profile, bias_from_klines,
 )
-from src.signals import compute_composite, htf_check  # noqa: E402
-from src.config import AppConfig  # noqa: E402
+from signals import compute_composite, htf_check
+from config import AppConfig
 
 
 def make_kline(close, high=None, low=None, volume=100.0, taker_buy=None):

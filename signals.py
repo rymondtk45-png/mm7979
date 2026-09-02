@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Tuple
 
-from .config import AppConfig
+from config import AppConfig
 
 LEGACY_MODULES = ["volume_profile", "tape_flow", "liquidation_impulse", "funding_extreme"]
 

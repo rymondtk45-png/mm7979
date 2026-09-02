@@ -23,7 +23,7 @@ try:
 except ImportError:  # pragma: no cover
     websocket = None
 
-from .config import AppConfig, get_logger
+from config import AppConfig, get_logger
 
 log = get_logger("data")
 

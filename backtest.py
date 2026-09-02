@@ -17,8 +17,8 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List
 
-from src.config import AppConfig, load_weights
-from src.signals import compute_composite, suggested_sl_tp
+from config import AppConfig, load_weights
+from signals import compute_composite, suggested_sl_tp
 
 
 def load_features(path: Path) -> List[dict]:
