@@ -1,8 +1,10 @@
 """
 config.py
+
 Cau hinh trung tam cho bot_mm_fund. Doc .env, doc weights.json, tien ich ghi JSONL.
 Khong dat lenh. Chi bao tin hieu.
 """
+
 from __future__ import annotations
 
 import json
@@ -56,10 +58,12 @@ def _get_list(name: str, default: List[str]) -> List[str]:
 class AppConfig:
     telegram_bot_token: str = field(default_factory=lambda: os.getenv("TELEGRAM_BOT_TOKEN", ""))
     telegram_chat_id: str = field(default_factory=lambda: os.getenv("TELEGRAM_CHAT_ID", ""))
+
     core_symbols: List[str] = field(default_factory=lambda: _get_list(
         "CORE_SYMBOLS", ["BTCUSDT", "ETHUSDT", "SOLUSDT"]))
     contract_type: str = field(default_factory=lambda: os.getenv("CONTRACT_TYPE", "PERPETUAL"))
     quote_asset: str = field(default_factory=lambda: os.getenv("QUOTE_ASSET", "USDT"))
+
     coinstrong_default: bool = field(default_factory=lambda: _get_bool("COINSTRONG", False))
     scan_limit_off: int = field(default_factory=lambda: _get_int("SCAN_LIMIT_OFF", 25))
     scan_limit_on: int = field(default_factory=lambda: _get_int("SCAN_LIMIT_ON", 200))
@@ -68,11 +72,6 @@ class AppConfig:
     universe_refresh_seconds: int = field(default_factory=lambda: _get_int("UNIVERSE_REFRESH_SECONDS", 60))
     exchanges: List[str] = field(default_factory=lambda: _get_list(
         "EXCHANGES", ["BINANCE", "OKX", "BYBIT", "BINGX", "KUCOIN", "BITGET", "MEXC"]))
-    # Them lai: bi thieu trong ban toi doc duoc tu GitHub (trang bi cat bot noi dung
-    # o cuoi data.py nen toi khong thay het cho dung cfg.cross_exchange_timeout).
-    # Gia tri mac dinh 5.0s khop voi timeout mac dinh cua safe_get() trong data.py.
-    cross_exchange_timeout: float = field(
-        default_factory=lambda: _get_float("CROSS_EXCHANGE_TIMEOUT", 5.0))
 
     # --- Full-model-for-all-pairs ---
     full_data_all: bool = field(default_factory=lambda: _get_bool("FULL_DATA_ALL", True))
@@ -97,11 +96,14 @@ class AppConfig:
     enable_telegram: bool = field(default_factory=lambda: _get_bool("ENABLE_TELEGRAM", True))
     enable_market_intel_scoring: bool = field(
         default_factory=lambda: _get_bool("ENABLE_MARKET_INTEL_SCORING", True))
+
     min_tf: str = field(default_factory=lambda: os.getenv("MIN_TF", "15m"))
     require_1h_align: bool = field(default_factory=lambda: _get_bool("REQUIRE_1H_ALIGN", True))
     require_4h_align: bool = field(default_factory=lambda: _get_bool("REQUIRE_4H_ALIGN", True))
+
     log_path: str = field(default_factory=lambda: os.getenv("LOG_PATH", "logs/signals.jsonl"))
     feature_log_path: str = field(default_factory=lambda: os.getenv("FEATURE_LOG_PATH", "logs/features.jsonl"))
+
     depth_levels: int = field(default_factory=lambda: _get_int("DEPTH_LEVELS", 20))
     tape_window_seconds: int = field(default_factory=lambda: _get_int("TAPE_WINDOW_SECONDS", 14400))
     large_print_quantile: float = field(default_factory=lambda: _get_float("LARGE_PRINT_QUANTILE", 0.995))
@@ -110,10 +112,10 @@ class AppConfig:
     profile_tick_buckets: int = field(default_factory=lambda: _get_int("PROFILE_TICK_BUCKETS", 40))
     signal_ttl_seconds: int = field(default_factory=lambda: _get_int("SIGNAL_TTL_SECONDS", 2400))
 
-    # --- /scan: theo doi thu cong 1 coin theo yeu cau nguoi dung ---
-    # Tan suat cap nhat dinh ky cho moi coin dang duoc /scan theo doi (giay).
-    # Mac dinh 300s = 5 phut. Doi bang bien moi truong SCAN_UPDATE_SECONDS (vd 600 = 10 phut).
+    # --- Lenh /scan (theo doi rieng 1 symbol theo yeu cau, khong phu thuoc
+    # scan_set/threshold/HTF veto cua vong lap alert chinh) ---
     scan_update_seconds: int = field(default_factory=lambda: _get_int("SCAN_UPDATE_SECONDS", 300))
+    scan_max_subscriptions: int = field(default_factory=lambda: _get_int("SCAN_MAX_SUBSCRIPTIONS", 20))
 
     def resolve_path(self, rel: str) -> Path:
         p = Path(rel)

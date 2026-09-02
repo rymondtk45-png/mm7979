@@ -2,7 +2,6 @@
 signals.py
 
 Module score + luat HTF veto + composite + ranking.
-
 Moi module tra ve signed float trong [-1, 1]: duong = nghieng long, am = nghieng short,
 do lon = do tin cay module do. Composite = sum(module_score * weight), sau do chuan hoa 0-100.
 """
@@ -264,6 +263,33 @@ MODULE_FUNCS = {
 }
 
 
+def _run_modules(f: dict, weights: Dict[str, float], cfg: AppConfig):
+    """Helper dung chung: chay toan bo module active, tra ve
+    (module_scores, total, max_possible, votes_long, votes_short)."""
+    active_modules = LEGACY_MODULES if not cfg.enable_market_intel_scoring else list(weights.keys())
+    module_scores: Dict[str, float] = {}
+    total = 0.0
+    max_possible = 0.0
+    votes_long = 0
+    votes_short = 0
+    for name in active_modules:
+        if name not in weights:
+            continue
+        func = MODULE_FUNCS.get(name)
+        if not func:
+            continue
+        raw = func(f)
+        module_scores[name] = raw
+        w = weights[name]
+        total += raw * w
+        max_possible += w
+        if raw > 0.05:
+            votes_long += 1
+        elif raw < -0.05:
+            votes_short += 1
+    return module_scores, total, max_possible, votes_long, votes_short
+
+
 def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dict:
     """
     Tra ve dict: score(0-100), direction(long/short/neutral), confidence(0-1),
@@ -281,29 +307,7 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
             "module_scores": {},
         }
 
-    active_modules = LEGACY_MODULES if not cfg.enable_market_intel_scoring else list(weights.keys())
-
-    module_scores: Dict[str, float] = {}
-    total = 0.0
-    max_possible = 0.0
-    votes_long = 0
-    votes_short = 0
-
-    for name in active_modules:
-        if name not in weights:
-            continue
-        func = MODULE_FUNCS.get(name)
-        if not func:
-            continue
-        raw = func(f)
-        module_scores[name] = raw
-        w = weights[name]
-        total += raw * w
-        max_possible += w
-        if raw > 0.05:
-            votes_long += 1
-        elif raw < -0.05:
-            votes_short += 1
+    module_scores, total, max_possible, votes_long, votes_short = _run_modules(f, weights, cfg)
 
     if abs(votes_long - votes_short) <= 1 and (votes_long + votes_short) > 0:
         reasons.append("veto: mixed (vote long/short chenh <=1)")
@@ -324,30 +328,8 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
         total *= 0.75
         reasons.append(f"spoof_score {spoof_score:.2f} > 0.6 -> x0.75")
 
-    # --- CHAM DIEM (FIX) --------------------------------------------------
-    # Truoc day: magnitude = abs(total) / max_possible, voi max_possible la
-    # tong trong so CUA CA 12 MODULE (ke ca module dang im lang, raw=0). Vi
-    # moi vong thuong chi 3-5/12 module len tieng, mau so co dinh = tong 12
-    # module lam diem bi pha loang rat manh du cac module dang len tieng co
-    # dong thuan gan tuyet doi -> diem tran o muc rat thap (~35-42), gan
-    # nhu khong bao gio cham nguong 65 dung theo toan hoc.
-    #
-    # Fix: chia cho tong trong so CUA CAC MODULE DANG LEN TIENG (active_weight)
-    # de do dung "do dong thuan trung binh" cua nhung module co y kien, roi
-    # nhan them he so "breadth" (ty le trong so dang len tieng / tong trong
-    # so toan bo) de van thuong cho viec co NHIEU module cung xac nhan -
-    # tranh truong hop 1-2 module hét to bi day diem gia tao. Khong doi
-    # module, khong doi weights.json, khong doi THRESHOLD, khong doi luat
-    # veto (mixed-vote o tren van giu nguyen).
-    active_weight = sum(weights[name] for name in module_scores if abs(module_scores[name]) > 0.05)
-    magnitude = abs(total) / active_weight if active_weight > 0 else 0.0
-
-    breadth = min(active_weight / max_possible, 1.0) if max_possible else 0.0
-    magnitude *= (0.5 + 0.5 * breadth)
-
+    magnitude = abs(total) / max_possible if max_possible else 0.0
     score = max(0.0, min(100.0, magnitude * 100.0))
-    # -----------------------------------------------------------------------
-
     confidence = magnitude
 
     if direction == "neutral" or score == 0.0:
@@ -368,6 +350,108 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
     }
 
 
+def compute_composite_scan(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dict:
+    """
+    Bien the CHI DUNG CHO LENH /scan (khong dung trong vong lap alert chinh
+    run_once/compute_composite): bo qua veto HTF va veto "mixed votes" de
+    /scan LUON tra ve mot huong entry co the xem, kem canh bao ro rang la
+    huong nay chua qua het lop bao ve cua he thong.
+
+    Logic:
+    1) Van chay htf_check() nhu binh thuong nhung CHI DE GHI LAI ly do
+       (htf_bypassed=True neu llo ra bi veto o composite chinh).
+    2) Tinh 12 module + tong co trong so nhu compute_composite. Neu tong
+       ro huong (>0 hoac <0) thi dung huong do. Neu tong = 0 (thuong xay
+       ra khi HTF veto lam bias 15m/1h/4h trung hoa lan nhau trong cac
+       module dua tren bias) hoac neu bi veto "mixed votes", KHONG con
+       tra ve neutral nua ma chon module co |raw*weight| lon nhat lam
+       huong de xuat (forced_by_strength=True) - dung "module manh nhat"
+       theo yeu cau nguoi dung.
+    3) Diem so (score/confidence) van tinh trung thuc: neu la huong bi
+       "ep" theo module manh nhat (khong phai dong thuan that su) thi
+       nhan them he so giam (x0.6) de phan biet voi tin hieu dong thuan
+       day du - tranh nguoi dung hieu lam day la tin hieu "chat luong
+       cao" ngang voi alert tu dong.
+
+    Tra ve dict giong compute_composite + them:
+      htf_bypassed (bool): True neu htf_check() dang veto (conflict/align).
+      htf_reason (str): ly do tu htf_check(), du co bypass hay khong.
+      mixed_votes (bool): True neu vote long/short dang mong manh (chenh <=1).
+      forced_by_strength (bool): True neu huong duoc chon tu module manh
+        nhat vi tong co trong so = 0 (khong the suy huong tu tong).
+    """
+    reasons: List[str] = []
+
+    allowed, htf_reason = htf_check(f.get("bias_15m", "neutral"), f.get("bias_1h", "neutral"),
+                                     f.get("bias_4h", "neutral"), cfg)
+    htf_bypassed = not allowed
+    reasons.append(htf_reason if allowed else f"{htf_reason} (BO QUA rieng cho /scan)")
+
+    module_scores, total, max_possible, votes_long, votes_short = _run_modules(f, weights, cfg)
+
+    mixed_votes = abs(votes_long - votes_short) <= 1 and (votes_long + votes_short) > 0
+    if mixed_votes:
+        reasons.append("canh bao: mixed (vote long/short chenh <=1) - /scan van hien theo module manh nhat")
+
+    if total > 0:
+        direction = "long"
+    elif total < 0:
+        direction = "short"
+    else:
+        direction = "neutral"
+
+    strongest_name = None
+    strongest_contrib = 0.0
+    for name, raw in module_scores.items():
+        contrib = raw * weights.get(name, 0.0)
+        if abs(contrib) > abs(strongest_contrib):
+            strongest_name, strongest_contrib = name, contrib
+
+    forced_by_strength = False
+    if direction == "neutral" and strongest_name and abs(strongest_contrib) > 1e-9:
+        direction = "long" if strongest_contrib > 0 else "short"
+        forced_by_strength = True
+        reasons.append(
+            f"khong co huong tong ro rang, dung module manh nhat '{strongest_name}' "
+            f"({strongest_contrib:+.3f}) -> nghieng {direction} (chi ap dung cho /scan)"
+        )
+
+    if direction != "neutral":
+        if f.get("bias_4h") != "neutral" and f.get("bias_4h") == direction:
+            total *= 1.15
+            reasons.append("4h aligned x1.15")
+
+        spoof_score = f.get("spoof_score", 0.0)
+        if spoof_score > 0.6:
+            total *= 0.75
+            reasons.append(f"spoof_score {spoof_score:.2f} > 0.6 -> x0.75")
+
+    magnitude = abs(total) / max_possible if max_possible else 0.0
+    if forced_by_strength and max_possible:
+        # tong bi trung hoa ve 0 nhung van co 1 module manh -> dung do lon
+        # cua module do lam proxy, giam bot (x0.6) vi day la tin hieu "mong"
+        # hon dong thuan that su (chi 1 module, khong phai tong hop nhieu module).
+        magnitude = min(abs(strongest_contrib) / max_possible, 1.0) * 0.6
+
+    score = max(0.0, min(100.0, magnitude * 100.0))
+    confidence = magnitude
+
+    if direction == "neutral":
+        reasons.append("khong co huong ro rang (ke ca module manh nhat cung = 0)")
+
+    top_modules = sorted(module_scores.items(), key=lambda kv: abs(kv[1]), reverse=True)[:4]
+    for name, val in top_modules:
+        if abs(val) > 0.05:
+            reasons.append(f"{name}: {'long' if val > 0 else 'short'} ({val:+.2f})")
+
+    return {
+        "score": score, "direction": direction, "confidence": confidence,
+        "reasons": reasons, "veto": False, "veto_reason": "", "module_scores": module_scores,
+        "htf_bypassed": htf_bypassed, "htf_reason": htf_reason,
+        "mixed_votes": mixed_votes, "forced_by_strength": forced_by_strength,
+    }
+
+
 def suggested_sl_tp(entry: float, direction: str, atr15m: float) -> Tuple[float, float]:
     """SL/TP tu ATR15m: SL = 0.8*ATR, TP = 1.5*ATR."""
     if direction == "long":
@@ -375,44 +459,6 @@ def suggested_sl_tp(entry: float, direction: str, atr15m: float) -> Tuple[float,
     if direction == "short":
         return entry + 0.8 * atr15m, entry - 1.5 * atr15m
     return entry, entry
-
-
-def suggested_sl_tp_multi(entry: float, direction: str, atr15m: float, atr4h: float,
-                           cfg: AppConfig) -> dict:
-    """
-    SL + 3 tang TP, dung cho chien luoc chot lai tung phan trong
-    SignalEngine._check_hits_and_expiry (app.py): TP1 chot cfg.tp1_close_pct +
-    doi SL ve breakeven, TP2 chot them cfg.tp2_close_pct + doi SL len TP1 (bat
-    dau trailing theo cfg.trail_atr4h_mult * atr4h, xem app.py), TP3 la muc
-    tieu xa / trailing bat kip truoc do.
-
-    Dung DUNG cac field da co san trong AppConfig (config.py):
-      - SL bam ATR15m (ngan han, sat gia): cfg.sl_atr_mult (mac dinh 1.2).
-      - Ca 3 TP tinh theo ATR4h (dai han, "an xa"), KHONG phai ATR15m:
-        cfg.tp1_atr4h_mult / cfg.tp2_atr4h_mult / cfg.tp3_atr4h_mult
-        (mac dinh 1.0 / 2.5 / 5.0).
-    Dung getattr(..., default) chi de phong truong hop cfg thieu field (vi du
-    ban .env cu chua co) - khong doi gia tri mac dinh so voi config.py.
-    """
-    sl_mult = getattr(cfg, "sl_atr_mult", 1.2)
-    tp1_mult = getattr(cfg, "tp1_atr4h_mult", 1.0)
-    tp2_mult = getattr(cfg, "tp2_atr4h_mult", 2.5)
-    tp3_mult = getattr(cfg, "tp3_atr4h_mult", 5.0)
-
-    if direction == "long":
-        sl = entry - sl_mult * atr15m
-        tp1 = entry + tp1_mult * atr4h
-        tp2 = entry + tp2_mult * atr4h
-        tp3 = entry + tp3_mult * atr4h
-    elif direction == "short":
-        sl = entry + sl_mult * atr15m
-        tp1 = entry - tp1_mult * atr4h
-        tp2 = entry - tp2_mult * atr4h
-        tp3 = entry - tp3_mult * atr4h
-    else:
-        sl = tp1 = tp2 = tp3 = entry
-
-    return {"sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3}
 
 
 def rank_top(results: List[dict], top_n: int = 5) -> List[dict]:
