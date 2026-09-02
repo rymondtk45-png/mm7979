@@ -384,11 +384,16 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
 
 
 def suggested_sl_tp(entry: float, direction: str, atr15m: float) -> Tuple[float, float]:
-    """SL/TP tu ATR15m: SL = 1.2*ATR, TP = 2.4*ATR (R:R = 2.0)."""
+    """SL/TP tu ATR15m.
+    SL = 1.3*ATR (tang nhe tu 1.2x - khong qua gan de tranh bi quet boi nhieu
+    ngan han, khong qua xa lam risk moi lenh phinh to bat hop ly).
+    TP = 3.0*ATR (tang tu 2.4x -> R:R = 2.3 thay vi 2.0) - cho lenh thang
+    nhieu khong gian chay hon, phu hop entry da duoc loc ky (>=4 module dong
+    thuan + HTF align) thay vi chot qua som."""
     if direction == "long":
-        return entry - 1.2 * atr15m, entry + 2.4 * atr15m
+        return entry - 1.3 * atr15m, entry + 3.0 * atr15m
     if direction == "short":
-        return entry + 1.2 * atr15m, entry - 2.4 * atr15m
+        return entry + 1.3 * atr15m, entry - 3.0 * atr15m
     return entry, entry
 
 
