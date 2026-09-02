@@ -374,6 +374,7 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
     module_scores: Dict[str, float] = {}
     total = 0.0
     max_possible = 0.0
+    active_weight = 0.0  # tong weight cua CHI cac module thuc su len tieng (|raw|>0.05)
     votes_long = 0
     votes_short = 0
 
@@ -390,8 +391,10 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
         max_possible += w
         if raw > 0.05:
             votes_long += 1
+            active_weight += w
         elif raw < -0.05:
             votes_short += 1
+            active_weight += w
 
     if abs(votes_long - votes_short) <= 1 and (votes_long + votes_short) > 0:
         reasons.append("veto: mixed (vote long/short chenh <=1)")
@@ -412,7 +415,25 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
         total *= 0.75
         reasons.append(f"spoof_score {spoof_score:.2f} > 0.6 -> x0.75")
 
-    magnitude = abs(total) / max_possible if max_possible else 0.0
+    # Chuan hoa: TRUOC DAY chia thang cho max_possible (tong weight CA 12 module,
+    # ke ca 7-9 module dang im lang do dieu kien kich hoat chat - vd funding_extreme
+    # can |z|>=1.5, liquidity_sweep can 2 dieu kien AND...). Vi da so thoi diem chi
+    # 3-5/12 module len tieng, diem bi PHA LOANG co he thong, gan nhu khong bao gio
+    # cham THRESHOLD=65 du thi truong bien dong manh hay khong.
+    #
+    # Sua: dung trung binh NHAN giua max_possible (toan bo model) va active_weight
+    # (chi module dang len tieng) lam mau so - khong danh doi ve chat luong:
+    # - Neu chi 1 module hét to 1 minh -> active_weight nho -> mau so van bi keo
+    #   ve gan max_possible (vi sqrt(max*active) >> active khi active << max)
+    #   -> diem KHONG the vot len cao chi vi 1 module don le (khong de bi "gian lan").
+    # - Neu nhieu module (4-8/12) dong thuan that su -> active_weight lon hon ->
+    #   mau so nho lai gan active_weight hon -> diem phan anh dung do dong thuan,
+    #   khong con bi pha loang boi cac module VON DI khong the len tieng cung luc
+    #   (vd volume_profile chi len tieng khi gia sat POC, basis_spread chi len
+    #   tieng khi basis cuc doan - 2 dieu kien nay hiem khi xay ra dong thoi,
+    #   khong co nghia la tin hieu "yeu").
+    denom = (max_possible * active_weight) ** 0.5 if active_weight > 0 else max_possible
+    magnitude = abs(total) / denom if denom else 0.0
     score = max(0.0, min(100.0, magnitude * 100.0))
     confidence = magnitude
 
