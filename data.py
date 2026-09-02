@@ -13,6 +13,7 @@ import statistics
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Deque, Dict, List, Optional, Tuple
 
@@ -54,7 +55,13 @@ SESSION = _session()
 class WeightLimiter:
     """Token-bucket theo 'request weight' cua Binance (gioi han that: 2400/phut/IP).
     Chu dong sleep truoc khi vuot ngan sach, thay vi de dinh 429/418 roi moi xu ly.
-    Thread-safe, dung chung cho moi worker."""
+    Thread-safe, dung chung cho moi worker.
+
+    CHI danh cho request toi Binance (fapi.binance.com). Cac san khac (cross-
+    exchange) dung safe_get_external() rieng, KHONG di qua limiter nay, vi
+    ngan sach 2400/phut la cua Binance, khong lien quan gi den OKX/Bybit/...
+    Gop chung se lam Binance bi bop toc do gia tao khi bat CROSS_EXCHANGE_ALL
+    cho hang tram cap."""
 
     def __init__(self, budget_per_min: int = 2000):
         self.budget = max(budget_per_min, 100)
@@ -119,6 +126,8 @@ REST_CACHE = TTLCache()
 
 
 def safe_get(url: str, params: dict = None, timeout: float = 5.0, weight: int = 1) -> Optional[dict]:
+    """Dung cho Binance (fapi.binance.com) - co WEIGHT_LIMITER + retry + xu ly
+    418/429 theo dung ngu canh rate-limit cua Binance."""
     for attempt in range(3):
         WEIGHT_LIMITER.acquire(weight)
         try:
@@ -135,6 +144,23 @@ def safe_get(url: str, params: dict = None, timeout: float = 5.0, weight: int = 
             log.warning("GET fail %s : %s", url, e)
             return None
     return None
+
+
+def safe_get_external(url: str, params: dict = None, timeout: float = 3.0) -> Optional[dict]:
+    """Danh cho cac san KHONG PHAI Binance (cross-exchange reference price).
+    Khong dung WEIGHT_LIMITER (ngan sach do la cua Binance, khong lien quan),
+    khong retry nhieu lan va timeout ngan hon - vi day chi la du lieu tham
+    khao (trong so 0.5 trong composite), 1 san bi cham/loi khong duoc phep
+    lam cham ca vong quet cua toan bo scan set."""
+    try:
+        r = SESSION.get(url, params=params, timeout=timeout)
+        if r.status_code in (418, 429):
+            return None
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:  # noqa: BLE001
+        log.debug("external GET fail %s : %s", url, e)
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -564,42 +590,88 @@ def fetch_long_short_ratio(symbol: str, cache_ttl: float = 0.0) -> Optional[floa
     return val
 
 
-def fetch_cross_exchange_price(exchange: str, symbol: str) -> Optional[float]:
-    """Best-effort, tra ve None neu loi (khong lam sap vong quet)."""
+def fetch_cross_exchange_price(exchange: str, symbol: str, timeout: float = 3.0) -> Optional[float]:
+    """Best-effort, tra ve None neu loi (khong lam sap vong quet).
+    Dung safe_get_external: KHONG di qua WEIGHT_LIMITER cua Binance."""
     base = symbol.replace("USDT", "")
     try:
         if exchange == "OKX":
             url = CROSS_EXCHANGE_ENDPOINTS["OKX"].format(inst=f"{base}-USDT-SWAP")
-            r = safe_get(url)
+            r = safe_get_external(url, timeout=timeout)
             return float(r["data"][0]["last"]) if r and r.get("data") else None
         if exchange == "BYBIT":
             url = CROSS_EXCHANGE_ENDPOINTS["BYBIT"].format(sym=symbol)
-            r = safe_get(url)
+            r = safe_get_external(url, timeout=timeout)
             lst = r["result"]["list"] if r and r.get("result") else []
             return float(lst[0]["lastPrice"]) if lst else None
         if exchange == "BINGX":
             url = CROSS_EXCHANGE_ENDPOINTS["BINGX"].format(inst=f"{base}-USDT")
-            r = safe_get(url)
+            r = safe_get_external(url, timeout=timeout)
             return float(r["data"]["price"]) if r and r.get("data") else None
         if exchange == "KUCOIN":
             url = CROSS_EXCHANGE_ENDPOINTS["KUCOIN"].format(inst=f"{base}USDTM")
-            r = safe_get(url)
+            r = safe_get_external(url, timeout=timeout)
             return float(r["data"]["price"]) if r and r.get("data") else None
         if exchange == "BITGET":
             url = CROSS_EXCHANGE_ENDPOINTS["BITGET"].format(sym=symbol)
-            r = safe_get(url)
+            r = safe_get_external(url, timeout=timeout)
             data = r.get("data") if r else None
             if data and isinstance(data, list):
                 return float(data[0]["lastPr"])
             return None
         if exchange == "MEXC":
             url = CROSS_EXCHANGE_ENDPOINTS["MEXC"].format(inst=f"{base}_USDT")
-            r = safe_get(url)
+            r = safe_get_external(url, timeout=timeout)
             return float(r["data"]["lastPrice"]) if r and r.get("data") else None
     except Exception as e:  # noqa: BLE001
         log.debug("cross-exchange %s %s loi: %s", exchange, symbol, e)
         return None
     return None
+
+
+def fetch_cross_exchange_avg(symbol: str, cfg: AppConfig) -> Optional[float]:
+    """Gia trung binh tu cac san khac Binance cho 1 symbol.
+
+    - Cache theo cfg.cross_exchange_cache_seconds: gia tham chieu cross-exchange
+      khong can fresh moi vong POLL_SECONDS, cache 30-60s la du (trong so module
+      nay trong composite chi 0.5, la boi canh chu khong phai trigger).
+    - Goi 6 san SONG SONG bang ThreadPoolExecutor thay vi tuan tu: neu khong,
+      bat CROSS_EXCHANGE_ALL cho ca tram cap se lam vong quet cham gap nhieu lan
+      (moi symbol phai cho tuan tu 6 request mang).
+    - 1 san bi cham/timeout khong lam mat gia cua 5 san con lai (best-effort).
+    """
+    cache_key = f"crossavg:{symbol}"
+    cached = REST_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    others = [ex for ex in cfg.exchanges if ex != "BINANCE"]
+    if not others:
+        return None
+
+    prices: List[float] = []
+    workers = max(min(cfg.cross_exchange_workers, len(others)), 1)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(fetch_cross_exchange_price, ex, symbol, cfg.cross_exchange_timeout): ex
+            for ex in others
+        }
+        for fut in as_completed(futures):
+            ex = futures[fut]
+            try:
+                p = fut.result()
+            except Exception as e:  # noqa: BLE001
+                log.debug("cross-exchange %s %s future loi: %s", ex, symbol, e)
+                continue
+            if p:
+                prices.append(p)
+
+    avg = (sum(prices) / len(prices)) if prices else None
+    # Cache ca ket qua None (TTL ngan hon) de tranh spam lai ngay lap tuc mot
+    # symbol khong ton tai / khong so gia duoc tren san nao.
+    ttl = cfg.cross_exchange_cache_seconds if avg is not None else min(cfg.cross_exchange_cache_seconds, 20)
+    REST_CACHE.set(cache_key, avg, ttl)
+    return avg
 
 
 # --------------------------------------------------------------------------
@@ -948,7 +1020,8 @@ def build_features(symbol: str, cfg: AppConfig, ctx: MarketContext, is_core: boo
     Gom toan bo du lieu can thiet cho 1 symbol thanh 1 dict 'features' dung chung
     cho ca signals.compute_composite() va ghi log features.jsonl.
     CORE: full data + cross-exchange. Khong CORE nhung trong WS set: tape/book live,
-    khong cross-exchange. Con lai (REST-only, van lay HTF kline): light snapshot.
+    khong cross-exchange (tru khi CROSS_EXCHANGE_ALL=true). Con lai (REST-only,
+    van lay HTF kline): light snapshot.
     """
     ctx.ensure_symbol(symbol)
     now_ms = int(time.time() * 1000)
@@ -1044,20 +1117,30 @@ def build_features(symbol: str, cfg: AppConfig, ctx: MarketContext, is_core: boo
     if klines_15m and klines_15m[-1]["volume"]:
         taker_ratio = klines_15m[-1]["taker_buy_base"] / klines_15m[-1]["volume"]
 
-    # cross_exchange_all mac dinh TAT: goi 6 san ngoai x 200 cap la chi phi/ rui ro
-    # cao nhat va it gia tri nhat cho alt (nhat la alt thanh khoan thap tren san
-    # khac). Neu can, bat qua bien moi truong CROSS_EXCHANGE_ALL=true.
+    # cross_exchange_all: bat cross-exchange divergence cho TOAN BO scan set
+    # (khong chi CORE). fetch_cross_exchange_avg tu goi song song 6 san +
+    # cache rieng (KHONG dung chung WEIGHT_LIMITER cua Binance), nen bat cho
+    # ca tram cap van an toan cho toc do vong quet va cho ngan sach Binance.
     cross_divergence = 0.0
     if use_cross:
-        prices = []
-        for ex in cfg.exchanges:
-            if ex == "BINANCE":
-                continue
-            p = fetch_cross_exchange_price(ex, symbol)
-            if p:
-                prices.append(p)
-        if prices and last_price:
-            avg_other = sum(prices) / len(prices)
+        if is_core:
+            # CORE: khong cache, luon lay gia moi nhat tu 6 san.
+            others = [ex for ex in cfg.exchanges if ex != "BINANCE"]
+            prices = []
+            with ThreadPoolExecutor(max_workers=max(len(others), 1)) as pool:
+                futures = [pool.submit(fetch_cross_exchange_price, ex, symbol, cfg.cross_exchange_timeout)
+                           for ex in others]
+                for fut in as_completed(futures):
+                    try:
+                        p = fut.result()
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if p:
+                        prices.append(p)
+            avg_other = (sum(prices) / len(prices)) if prices else None
+        else:
+            avg_other = fetch_cross_exchange_avg(symbol, cfg)
+        if avg_other and last_price:
             cross_divergence = (last_price - avg_other) / avg_other
 
     return {

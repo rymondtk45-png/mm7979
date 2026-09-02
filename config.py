@@ -75,6 +75,15 @@ class AppConfig:
     # --- Full-model-for-all-pairs ---
     full_data_all: bool = field(default_factory=lambda: _get_bool("FULL_DATA_ALL", True))
     cross_exchange_all: bool = field(default_factory=lambda: _get_bool("CROSS_EXCHANGE_ALL", False))
+    # Cache + timeout + so worker song song danh rieng cho cross-exchange, tach
+    # biet voi WEIGHT_LIMITER cua Binance de khong bop toc do goi Binance khi
+    # bat cross-exchange cho toan bo scan set (co the 100-200+ cap).
+    cross_exchange_cache_seconds: int = field(
+        default_factory=lambda: _get_int("CROSS_EXCHANGE_CACHE_SECONDS", 45))
+    cross_exchange_timeout: float = field(
+        default_factory=lambda: _get_float("CROSS_EXCHANGE_TIMEOUT", 3.0))
+    cross_exchange_workers: int = field(
+        default_factory=lambda: _get_int("CROSS_EXCHANGE_WORKERS", 6))
     ws_cover_all: bool = field(default_factory=lambda: _get_bool("WS_COVER_ALL", True))
     ws_chunk_size: int = field(default_factory=lambda: _get_int("WS_CHUNK_SIZE", 40))
     max_workers: int = field(default_factory=lambda: _get_int("MAX_WORKERS", 12))
