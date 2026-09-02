@@ -32,6 +32,14 @@ def main() -> None:
     log.info("Khoi dong bot_mm_fund. CORE_SYMBOLS=%s | THRESHOLD=%.1f | POLL=%ss",
               cfg.core_symbols, cfg.threshold, cfg.poll_seconds)
     log.info("Bot CHI BAO TIN HIEU, khong tu dong dat lenh.")
+    token_status = "DA CO (do dai %d ky tu)" % len(cfg.telegram_bot_token) if cfg.telegram_bot_token else "RONG - CHUA CAU HINH"
+    chat_status = cfg.telegram_chat_id if cfg.telegram_chat_id else "RONG - CHUA CAU HINH"
+    log.info("ENABLE_TELEGRAM=%s | TELEGRAM_BOT_TOKEN=%s | TELEGRAM_CHAT_ID=%s",
+              cfg.enable_telegram, token_status, chat_status)
+    if cfg.enable_telegram and (not cfg.telegram_bot_token or not cfg.telegram_chat_id):
+        log.warning("Telegram dang BAT nhung thieu token/chat_id -> se KHONG gui/nhan duoc tin nhan. "
+                    "Kiem tra bien moi truong TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID tren Railway "
+                    "(tab Variables, khong phai file .env trong repo).")
     engine.start()
 
 

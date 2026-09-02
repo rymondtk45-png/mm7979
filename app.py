@@ -32,32 +32,74 @@ class TelegramBot:
         if not self.cfg.enable_telegram or not self.cfg.telegram_bot_token:
             log.info("[TELEGRAM-DISABLED] %s", text.replace("\n", " | "))
             return
+        if not self.cfg.telegram_chat_id:
+            log.warning("TELEGRAM_CHAT_ID rong -> khong gui duoc tin nhan: %s",
+                        text.replace("\n", " | "))
+            return
         try:
-            requests.post(self._api("sendMessage"), data={
+            resp = requests.post(self._api("sendMessage"), data={
                 "chat_id": self.cfg.telegram_chat_id, "text": text,
                 "parse_mode": "HTML", "disable_web_page_preview": True,
             }, timeout=8)
+            data = resp.json()
+            if not data.get("ok"):
+                log.warning("Telegram sendMessage tra ve loi: %s", data)
         except Exception as e:  # noqa: BLE001
             log.warning("Telegram send loi: %s", e)
 
     def poll_commands_forever(self) -> None:
-        if not self.cfg.enable_telegram or not self.cfg.telegram_bot_token:
+        if not self.cfg.enable_telegram:
+            log.warning("ENABLE_TELEGRAM=False -> khong lang nghe lenh Telegram.")
             return
+        if not self.cfg.telegram_bot_token:
+            log.warning("TELEGRAM_BOT_TOKEN rong -> khong lang nghe lenh Telegram. "
+                        "Kiem tra bien moi truong tren Railway (tab Variables).")
+            return
+        ok = self._verify_bot_token()
+        if not ok:
+            log.error("TELEGRAM_BOT_TOKEN khong hop le (Telegram tra ve loi khi goi getMe). "
+                       "Kiem tra lai token.")
+            return
+        log.info("Da ket noi Telegram OK, bat dau lang nghe lenh /coinstrong ...")
         while not self._stop.is_set():
             try:
                 resp = requests.get(self._api("getUpdates"), params={
                     "timeout": 20, "offset": self._offset,
                 }, timeout=25)
                 data = resp.json()
+                if not data.get("ok", True):
+                    log.warning("Telegram getUpdates tra ve loi: %s", data)
+                    time.sleep(3)
+                    continue
                 for upd in data.get("result", []):
                     self._offset = upd["update_id"] + 1
                     msg = upd.get("message", {})
-                    text = (msg.get("text") or "").strip().lower()
+                    text_raw = msg.get("text") or ""
+                    text = text_raw.strip().lower()
+                    chat_id = str(msg.get("chat", {}).get("id", ""))
+                    log.info("Nhan tin nhan Telegram tu chat_id=%s: %r", chat_id, text_raw)
                     if text.startswith("/coinstrong"):
                         self._handle_coinstrong(text)
+                    elif text.startswith("/start"):
+                        self.send_message(
+                            "Bot bao tin hieu MM/quy da san sang.\n"
+                            "Dung /coinstrong on|off|status de dieu khien vu tru quet.")
             except Exception as e:  # noqa: BLE001
                 log.warning("Telegram poll loi: %s", e)
                 time.sleep(3)
+
+    def _verify_bot_token(self) -> bool:
+        try:
+            resp = requests.get(self._api("getMe"), timeout=8)
+            data = resp.json()
+            if data.get("ok"):
+                log.info("Telegram bot xac thuc OK: @%s", data["result"].get("username"))
+                return True
+            log.error("Telegram getMe that bai: %s", data)
+            return False
+        except Exception as e:  # noqa: BLE001
+            log.error("Khong the ket noi Telegram API de xac thuc token: %s", e)
+            return False
 
     def _handle_coinstrong(self, text: str) -> None:
         parts = text.split()
