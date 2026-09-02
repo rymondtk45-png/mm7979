@@ -12,6 +12,14 @@ from config import AppConfig
 
 LEGACY_MODULES = ["volume_profile", "tape_flow", "liquidation_impulse", "funding_extreme"]
 
+# Nguong de mot module duoc coi la "dang co tin hieu" (khac 0 mot cach co nghia).
+# Dung chung cho ca vote long/short (mixed veto) VA chuan hoa score, de 2 co che nhat quan.
+MODULE_ACTIVE_EPS = 0.05
+
+# So module toi thieu can "song" (active) de duoc tinh full-confidence.
+# Neu it hon, se bi giam confidence theo ty le (tranh 2 module le te dot bien thanh score 90+).
+MIN_CONFLUENCE_MODULES = 4
+
 
 def htf_check(bias_15m: str, bias_1h: str, bias_4h: str, cfg: AppConfig) -> Tuple[bool, str]:
     """
@@ -197,7 +205,8 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
 
     module_scores: Dict[str, float] = {}
     total = 0.0
-    max_possible = 0.0
+    active_weight = 0.0      # CHI cong trong so cua module dang "song" (|raw| > EPS)
+    active_count = 0
     votes_long = 0
     votes_short = 0
     for name in active_modules:
@@ -210,11 +219,13 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
         module_scores[name] = raw
         w = weights[name]
         total += raw * w
-        max_possible += w
-        if raw > 0.05:
-            votes_long += 1
-        elif raw < -0.05:
-            votes_short += 1
+        if abs(raw) > MODULE_ACTIVE_EPS:
+            active_weight += w
+            active_count += 1
+            if raw > 0:
+                votes_long += 1
+            else:
+                votes_short += 1
 
     if abs(votes_long - votes_short) <= 1 and (votes_long + votes_short) > 0:
         reasons.append("veto: mixed (vote long/short chenh <=1)")
@@ -235,7 +246,19 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
         total *= 0.75
         reasons.append(f"spoof_score {spoof_score:.2f} > 0.6 -> x0.75")
 
-    magnitude = abs(total) / max_possible if max_possible else 0.0
+    # CHUAN HOA DONG: chia cho tong trong so cua CAC MODULE DANG SONG trong vong quet
+    # nay, thay vi luon chia cho tong 12 module co dinh. Truoc day cach cu khien score
+    # bi "pha loang" boi cac module dang = 0 (khong co su kien), nen hiem khi vuot nguong.
+    magnitude = abs(total) / active_weight if active_weight else 0.0
+
+    # Confluence factor: neu qua it module dong thuan (< MIN_CONFLUENCE_MODULES), giam
+    # confidence theo ty le -> tranh truong hop 2 module le te vong len score rat cao
+    # (chi trong 12 module ma 2 module cung huong da du qua "mixed veto" o tren).
+    confluence = min(active_count / MIN_CONFLUENCE_MODULES, 1.0)
+    magnitude *= confluence
+    if confluence < 1.0:
+        reasons.append(f"confluence {active_count}/{MIN_CONFLUENCE_MODULES} module -> x{confluence:.2f}")
+
     score = max(0.0, min(100.0, magnitude * 100.0))
     confidence = magnitude
 
