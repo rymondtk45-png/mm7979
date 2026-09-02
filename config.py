@@ -4,7 +4,6 @@ config.py
 Cau hinh trung tam cho bot_mm_fund. Doc .env, doc weights.json, tien ich ghi JSONL.
 Khong dat lenh. Chi bao tin hieu.
 """
-
 from __future__ import annotations
 
 import json
@@ -58,12 +57,10 @@ def _get_list(name: str, default: List[str]) -> List[str]:
 class AppConfig:
     telegram_bot_token: str = field(default_factory=lambda: os.getenv("TELEGRAM_BOT_TOKEN", ""))
     telegram_chat_id: str = field(default_factory=lambda: os.getenv("TELEGRAM_CHAT_ID", ""))
-
     core_symbols: List[str] = field(default_factory=lambda: _get_list(
         "CORE_SYMBOLS", ["BTCUSDT", "ETHUSDT", "SOLUSDT"]))
     contract_type: str = field(default_factory=lambda: os.getenv("CONTRACT_TYPE", "PERPETUAL"))
     quote_asset: str = field(default_factory=lambda: os.getenv("QUOTE_ASSET", "USDT"))
-
     coinstrong_default: bool = field(default_factory=lambda: _get_bool("COINSTRONG", False))
     scan_limit_off: int = field(default_factory=lambda: _get_int("SCAN_LIMIT_OFF", 25))
     scan_limit_on: int = field(default_factory=lambda: _get_int("SCAN_LIMIT_ON", 200))
@@ -76,13 +73,17 @@ class AppConfig:
     # --- Full-model-for-all-pairs ---
     full_data_all: bool = field(default_factory=lambda: _get_bool("FULL_DATA_ALL", True))
     cross_exchange_all: bool = field(default_factory=lambda: _get_bool("CROSS_EXCHANGE_ALL", False))
+    # FIX: field nay bi thieu truoc day -> AttributeError 'cross_exchange_timeout'
+    # moi vong quet cho CORE_SYMBOLS (BTC/ETH/SOL), khien 3 symbol nay bi loi
+    # xu ly va rot khoi ket qua scoring. Timeout (giay) cho moi request gia
+    # tham chieu tu 1 san doi tac trong buoc cross-exchange divergence.
+    cross_exchange_timeout: float = field(default_factory=lambda: _get_float("CROSS_EXCHANGE_TIMEOUT", 3.0))
     ws_cover_all: bool = field(default_factory=lambda: _get_bool("WS_COVER_ALL", True))
     ws_chunk_size: int = field(default_factory=lambda: _get_int("WS_CHUNK_SIZE", 40))
     max_workers: int = field(default_factory=lambda: _get_int("MAX_WORKERS", 12))
 
     # Ngan sach weight/phut, de duoi gioi han that cua Binance Futures (2400/phut/IP)
     weight_budget_per_min: int = field(default_factory=lambda: _get_int("WEIGHT_BUDGET_PER_MIN", 2000))
-
     funding_cache_seconds: int = field(default_factory=lambda: _get_int("FUNDING_CACHE_SECONDS", 120))
     oi_cache_seconds: int = field(default_factory=lambda: _get_int("OI_CACHE_SECONDS", 60))
     lsr_cache_seconds: int = field(default_factory=lambda: _get_int("LSR_CACHE_SECONDS", 120))
@@ -111,11 +112,6 @@ class AppConfig:
     book_persist_ms: int = field(default_factory=lambda: _get_int("BOOK_PERSIST_MS", 1000))
     profile_tick_buckets: int = field(default_factory=lambda: _get_int("PROFILE_TICK_BUCKETS", 40))
     signal_ttl_seconds: int = field(default_factory=lambda: _get_int("SIGNAL_TTL_SECONDS", 2400))
-
-    # --- Lenh /scan (theo doi rieng 1 symbol theo yeu cau, khong phu thuoc
-    # scan_set/threshold/HTF veto cua vong lap alert chinh) ---
-    scan_update_seconds: int = field(default_factory=lambda: _get_int("SCAN_UPDATE_SECONDS", 300))
-    scan_max_subscriptions: int = field(default_factory=lambda: _get_int("SCAN_MAX_SUBSCRIPTIONS", 20))
 
     def resolve_path(self, rel: str) -> Path:
         p = Path(rel)
