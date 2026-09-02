@@ -1035,6 +1035,9 @@ def build_features(symbol: str, cfg: AppConfig, ctx: MarketContext, is_core: boo
     bias_4h = bias_from_klines(klines_4h, 12)
 
     atr15m = compute_atr(klines_15m, period=14)
+    # ATR khung 4h - dung lam co so cho TP nhieu tang (xem signals.suggested_sl_tp_multi).
+    # Tan dung klines_4h da fetch san o tren (cho bias_4h) - khong ton them API call.
+    atr4h = compute_atr(klines_4h, period=14)
     last_price = klines_15m[-1]["close"] if klines_15m else 0.0
 
     sweep = detect_sweep(klines_15m, klines_1h)
@@ -1145,7 +1148,7 @@ def build_features(symbol: str, cfg: AppConfig, ctx: MarketContext, is_core: boo
 
     return {
         "symbol": symbol, "ts": now_ms, "is_core": is_core, "is_ws_tracked": is_ws_tracked,
-        "last_price": last_price, "atr15m": atr15m,
+        "last_price": last_price, "atr15m": atr15m, "atr4h": atr4h,
         "bias_15m": bias_15m, "bias_1h": bias_1h, "bias_4h": bias_4h,
         "regime": regime, "sweep": sweep,
         "volume_profile": vp,

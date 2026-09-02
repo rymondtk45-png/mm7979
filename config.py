@@ -68,14 +68,14 @@ class AppConfig:
     universe_refresh_seconds: int = field(default_factory=lambda: _get_int("UNIVERSE_REFRESH_SECONDS", 60))
     exchanges: List[str] = field(default_factory=lambda: _get_list(
         "EXCHANGES", ["BINANCE", "OKX", "BYBIT", "BINGX", "KUCOIN", "BITGET", "MEXC"]))
-    # Timeout (giay) cho moi request cross-exchange (chi ap dung CORE_SYMBOLS).
-    # Bi thieu truoc day -> AttributeError moi vong quet BTC/ETH/SOL, khien 3
-    # symbol nay luon loi va bi loai khoi ket qua composite/TOP5.
-    cross_exchange_timeout: float = field(default_factory=lambda: _get_float("CROSS_EXCHANGE_TIMEOUT", 5.0))
 
     # --- Full-model-for-all-pairs ---
     full_data_all: bool = field(default_factory=lambda: _get_bool("FULL_DATA_ALL", True))
     cross_exchange_all: bool = field(default_factory=lambda: _get_bool("CROSS_EXCHANGE_ALL", False))
+    cross_exchange_workers: int = field(default_factory=lambda: _get_int("CROSS_EXCHANGE_WORKERS", 6))
+    cross_exchange_timeout: float = field(default_factory=lambda: _get_float("CROSS_EXCHANGE_TIMEOUT", 3.0))
+    cross_exchange_cache_seconds: float = field(
+        default_factory=lambda: _get_float("CROSS_EXCHANGE_CACHE_SECONDS", 45))
     ws_cover_all: bool = field(default_factory=lambda: _get_bool("WS_COVER_ALL", True))
     ws_chunk_size: int = field(default_factory=lambda: _get_int("WS_CHUNK_SIZE", 40))
     max_workers: int = field(default_factory=lambda: _get_int("MAX_WORKERS", 12))
@@ -96,26 +96,36 @@ class AppConfig:
     enable_telegram: bool = field(default_factory=lambda: _get_bool("ENABLE_TELEGRAM", True))
     enable_market_intel_scoring: bool = field(
         default_factory=lambda: _get_bool("ENABLE_MARKET_INTEL_SCORING", True))
-
-    # --- Luat dong thuan module (README muc 6.5): can >=N module co y kien
-    # VA chenh lech phieu long/short >=M moi khong bi veto "weak consensus".
-    # Mac dinh dung theo README (4 module, chenh lech 3) - co the chinh qua
-    # bien moi truong neu muon long/chat hon.
-    min_consensus_modules: int = field(default_factory=lambda: _get_int("MIN_CONSENSUS_MODULES", 4))
-    min_consensus_vote_diff: int = field(default_factory=lambda: _get_int("MIN_CONSENSUS_VOTE_DIFF", 3))
-
     min_tf: str = field(default_factory=lambda: os.getenv("MIN_TF", "15m"))
     require_1h_align: bool = field(default_factory=lambda: _get_bool("REQUIRE_1H_ALIGN", True))
     require_4h_align: bool = field(default_factory=lambda: _get_bool("REQUIRE_4H_ALIGN", True))
+
     log_path: str = field(default_factory=lambda: os.getenv("LOG_PATH", "logs/signals.jsonl"))
     feature_log_path: str = field(default_factory=lambda: os.getenv("FEATURE_LOG_PATH", "logs/features.jsonl"))
+
     depth_levels: int = field(default_factory=lambda: _get_int("DEPTH_LEVELS", 20))
     tape_window_seconds: int = field(default_factory=lambda: _get_int("TAPE_WINDOW_SECONDS", 14400))
     large_print_quantile: float = field(default_factory=lambda: _get_float("LARGE_PRINT_QUANTILE", 0.995))
     min_large_print_usd: float = field(default_factory=lambda: _get_float("MIN_LARGE_PRINT_USD", 50000))
     book_persist_ms: int = field(default_factory=lambda: _get_int("BOOK_PERSIST_MS", 1000))
     profile_tick_buckets: int = field(default_factory=lambda: _get_int("PROFILE_TICK_BUCKETS", 40))
-    signal_ttl_seconds: int = field(default_factory=lambda: _get_int("SIGNAL_TTL_SECONDS", 2400))
+
+    # --- SL/TP nhieu tang (multi-target) ---
+    # SL bam ATR15m (ngan han, sat gia, giu nguyen theo yeu cau).
+    sl_atr_mult: float = field(default_factory=lambda: _get_float("SL_ATR_MULT", 1.2))
+    # TP 3 tang tinh theo ATR4h (dai han) thay vi ATR15m -> moi thuc su "an xa" duoc.
+    tp1_atr4h_mult: float = field(default_factory=lambda: _get_float("TP1_ATR4H_MULT", 1.0))
+    tp2_atr4h_mult: float = field(default_factory=lambda: _get_float("TP2_ATR4H_MULT", 2.5))
+    tp3_atr4h_mult: float = field(default_factory=lambda: _get_float("TP3_ATR4H_MULT", 5.0))
+    # % dong lenh (chi de hien thi trong alert, bot khong dat lenh that) tai moi tang.
+    tp1_close_pct: float = field(default_factory=lambda: _get_float("TP1_CLOSE_PCT", 0.5))
+    tp2_close_pct: float = field(default_factory=lambda: _get_float("TP2_CLOSE_PCT", 0.3))
+    # Sau khi cham TP2, SL chuyen sang trailing stop bam theo ATR4h phia sau gia.
+    trail_atr4h_mult: float = field(default_factory=lambda: _get_float("TRAIL_ATR4H_MULT", 1.5))
+
+    # TTL nang len 3 ngay (thay vi 40 phut) vi TP gio tinh theo ATR4h, can nhieu
+    # thoi gian hon de gia co co hoi chay den cac tang TP xa.
+    signal_ttl_seconds: int = field(default_factory=lambda: _get_int("SIGNAL_TTL_SECONDS", 259200))
 
     def resolve_path(self, rel: str) -> Path:
         p = Path(rel)

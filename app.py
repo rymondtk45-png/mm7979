@@ -5,6 +5,7 @@ Chi bao tin hieu qua Telegram. Khong dat lenh tren san.
 """
 from __future__ import annotations
 
+import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -14,7 +15,7 @@ import requests
 
 from config import AppConfig, append_jsonl, get_logger, load_weights
 from data import MarketContext, UniverseManager, build_features, init_rate_limiter
-from signals import classify_entry, compute_composite, rank_top, suggested_sl_tp
+from signals import classify_entry, compute_composite, rank_top, suggested_sl_tp_multi
 
 log = get_logger("app")
 
@@ -56,11 +57,13 @@ class TelegramBot:
             log.warning("TELEGRAM_BOT_TOKEN rong -> khong lang nghe lenh Telegram. "
                         "Kiem tra bien moi truong tren Railway (tab Variables).")
             return
+
         ok = self._verify_bot_token()
         if not ok:
             log.error("TELEGRAM_BOT_TOKEN khong hop le (Telegram tra ve loi khi goi getMe). "
-                       "Kiem tra lai token.")
+                      "Kiem tra lai token.")
             return
+
         log.info("Da ket noi Telegram OK, bat dau lang nghe lenh /coinstrong ...")
         while not self._stop.is_set():
             try:
@@ -108,6 +111,7 @@ class TelegramBot:
             self.universe.set_coinstrong(True)
         elif len(parts) >= 2 and parts[1] == "off":
             self.universe.set_coinstrong(False)
+
         self.universe.refresh(force=True)
         scan = self.universe.get_scan_set()
         state = "ON" if self.universe.coinstrong else "OFF"
@@ -122,7 +126,8 @@ class TelegramBot:
         self._stop.set()
 
 
-def format_alert(f: dict, result: dict, entry_info: dict, sl: float, tp: float) -> str:
+def format_alert(f: dict, result: dict, entry_info: dict, sltp: dict) -> str:
+    """sltp: dict co cac khoa sl, tp1, tp2, tp3 (xem signals.suggested_sl_tp_multi)."""
     direction = result["direction"].upper()
     entry_type = entry_info["entry_type"]
     entry_price = entry_info["entry_price"]
@@ -130,31 +135,27 @@ def format_alert(f: dict, result: dict, entry_info: dict, sl: float, tp: float) 
     reasons = "\n".join(f"• {r}" for r in result["reasons"])
     lsr = f.get("long_short_ratio")
     lsr_str = f"{lsr:.2f}" if lsr is not None else "n/a"
+
     entry_line = (
         f"Entry: {entry_price:.6g} MARKET (vao ngay)" if entry_type == "MARKET"
         else f"Entry: {entry_price:.6g} LIMIT (cho khop, gia hien tai {f['last_price']:.6g})"
     )
+
     return (
         f"<b>{f['symbol']} {direction}</b>\n"
         f"Module | Regime: {f['regime']}\n"
         f"Score: {result['score']:.1f} | Confidence: {result['confidence']:.2f}\n"
         f"{entry_line}\n"
-        f"SL: {sl:.6g} | TP: {tp:.6g}\n"
+        f"SL: {sltp['sl']:.6g}\n"
+        f"TP1: {sltp['tp1']:.6g} (chot 50%, SL -> breakeven)\n"
+        f"TP2: {sltp['tp2']:.6g} (chot them 30%, SL -> TP1, bat dau trailing)\n"
+        f"TP3: {sltp['tp3']:.6g} (muc tieu xa, hoac trailing bat kip truoc do)\n"
         f"Ly do entry: {entry_info['reason']}\n"
         f"HTF 15m/1h/4h: {f['bias_15m']}/{f['bias_1h']}/{f['bias_4h']}\n"
         f"POC15m: {vp.get('poc', 0):.6g} | CVD5m: {f['cvd_5m']:.2f} | spoof: {f['spoof_score']:.2f}\n"
         f"Long/Short ratio: {lsr_str}\n"
         f"{reasons}"
     )
-
-
-def _pnl_pct(direction: str, entry_price: float, price: float) -> float:
-    """% lai/lo tuong doi so voi gia entry (chua tru phi/funding)."""
-    if entry_price == 0:
-        return 0.0
-    if direction == "long":
-        return (price - entry_price) / entry_price * 100.0
-    return (entry_price - price) / entry_price * 100.0
 
 
 class SignalEngine:
@@ -165,10 +166,35 @@ class SignalEngine:
         self.ctx = MarketContext(cfg)
         self.bot = TelegramBot(cfg, self.universe)
         self.cooldowns: Dict[str, float] = {}
-        self.active_signals: Dict[str, dict] = {}
         self._state_lock = threading.Lock()
         self._stop = threading.Event()
         init_rate_limiter(cfg)
+
+        # Persist active_signals xuong dia de khong mat theo doi TP/SL khi bot
+        # bi restart (vi du Railway redeploy) - quan trong vi TTL gio dai (ngay)
+        # nen kha nang bot restart giua chung 1 tin hieu la co that.
+        self._state_path = self.cfg.resolve_path("logs/active_signals.json")
+        self.active_signals: Dict[str, dict] = self._load_active_signals()
+        if self.active_signals:
+            log.info("Da khoi phuc %d tin hieu dang theo doi tu %s",
+                      len(self.active_signals), self._state_path)
+
+    def _load_active_signals(self) -> Dict[str, dict]:
+        if self._state_path.exists():
+            try:
+                return json.loads(self._state_path.read_text(encoding="utf-8"))
+            except Exception as e:  # noqa: BLE001
+                log.warning("Khong doc duoc active_signals.json (%s) -> bat dau rong", e)
+        return {}
+
+    def _save_active_signals(self) -> None:
+        try:
+            self._state_path.write_text(
+                json.dumps(self.active_signals, ensure_ascii=False, default=str),
+                encoding="utf-8",
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("Khong luu duoc active_signals.json: %s", e)
 
     def start(self) -> None:
         self.universe.refresh(force=True)
@@ -188,20 +214,30 @@ class SignalEngine:
             self.ctx.stream.stop()
 
     def _check_hits_and_expiry(self, current_prices: Dict[str, float]) -> None:
+        """
+        Theo doi tin hieu dang active qua 3 tang TP + trailing stop sau TP2:
+          - Chua khop (LIMIT): cho gia cham entry_price, het TTL ma chua khop -> huy.
+          - SL cham (o bat ky stage nao, ke ca da doi len breakeven/TP1/trailing)
+            -> dong tin hieu, log kem stage de biet da chot duoc bao nhieu truoc do.
+          - stage 0 -> 1: cham TP1 -> chot mot phan, doi SL ve entry (breakeven).
+          - stage 1 -> 2: cham TP2 -> chot them, doi SL len TP1 (khoa loi), tu day
+            SL duoc trailing theo ATR4h thay vi co dinh.
+          - stage >= 2: cap nhat trailing stop moi vong lap; cham TP3 -> dong het.
+          - Het TTL o bat ky stage nao -> bao trang thai hien tai roi dong, khong
+            de tin hieu "bien mat" trong im lang.
+        """
         now = time.time()
-        expired = []
+        expired: List[str] = []
+
         for sym, sig in list(self.active_signals.items()):
             price = current_prices.get(sym)
             if price is None:
                 continue
             direction = sig["direction"]
+            long = direction == "long"
 
             if not sig["filled"]:
-                # Kèo LIMIT: chua khop, chi theo doi xem gia da cham entry_price
-                # chua truoc khi bat dau tinh TP/SL. MARKET thi filled=True ngay
-                # tu luc tao nen khong bao gio vao nhanh nay.
-                touched = ((direction == "long" and price <= sig["entry_price"])
-                           or (direction == "short" and price >= sig["entry_price"]))
+                touched = (price <= sig["entry_price"]) if long else (price >= sig["entry_price"])
                 if touched:
                     sig["filled"] = True
                     self.bot.send_message(
@@ -210,55 +246,92 @@ class SignalEngine:
                         "ts": now, "symbol": sym, "event": "limit_filled", "price": price,
                     })
                 elif now - sig["created_at"] > self.cfg.signal_ttl_seconds:
-                    # Limit cho qua lau khong khop -> huy, khong tinh la mot lenh da vao.
-                    self.bot.send_message(
-                        f"<b>{sym}</b> {direction.upper()} LIMIT het han, chua khop "
-                        f"(entry {sig['entry_price']:.6g}, gia hien tai {price:.6g}) -> huy kèo")
                     append_jsonl(self.cfg.resolve_path(self.cfg.log_path), {
                         "ts": now, "symbol": sym, "event": "limit_expired_unfilled",
-                        "entry": sig["entry_price"], "price": price,
                     })
                     expired.append(sym)
-                if not sig["filled"]:
+                continue
+
+            # --- SL (co the da doi len breakeven / TP1 / dang trailing) ---
+            hit_sl = (price <= sig["sl"]) if long else (price >= sig["sl"])
+            if hit_sl:
+                self.bot.send_message(
+                    f"<b>{sym}</b> {direction.upper()} da cham SL tai {price:.6g} "
+                    f"(stage={sig['stage']})")
+                append_jsonl(self.cfg.resolve_path(self.cfg.log_path), {
+                    "ts": now, "symbol": sym, "event": f"hit_SL_stage{sig['stage']}", "price": price,
+                })
+                expired.append(sym)
+                continue
+
+            stage = sig["stage"]
+
+            if stage < 1:
+                hit_tp1 = (price >= sig["tp1"]) if long else (price <= sig["tp1"])
+                if hit_tp1:
+                    sig["stage"] = 1
+                    sig["sl"] = sig["entry_price"]
+                    self.bot.send_message(
+                        f"<b>{sym}</b> {direction.upper()} cham TP1 tai {price:.6g} -> "
+                        f"chot {self.cfg.tp1_close_pct * 100:.0f}%, doi SL ve breakeven "
+                        f"({sig['sl']:.6g})")
+                    append_jsonl(self.cfg.resolve_path(self.cfg.log_path), {
+                        "ts": now, "symbol": sym, "event": "hit_TP1", "price": price,
+                    })
+                    self._save_active_signals()
                     continue
 
-            hit = None
-            if direction == "long":
-                if price <= sig["sl"]:
-                    hit = "SL"
-                elif price >= sig["tp"]:
-                    hit = "TP"
-            elif direction == "short":
-                if price >= sig["sl"]:
-                    hit = "SL"
-                elif price <= sig["tp"]:
-                    hit = "TP"
-            if hit:
-                pnl_pct = _pnl_pct(direction, sig["entry_price"], price)
+            if stage < 2:
+                hit_tp2 = (price >= sig["tp2"]) if long else (price <= sig["tp2"])
+                if hit_tp2:
+                    sig["stage"] = 2
+                    sig["sl"] = sig["tp1"]
+                    self.bot.send_message(
+                        f"<b>{sym}</b> {direction.upper()} cham TP2 tai {price:.6g} -> "
+                        f"chot them {self.cfg.tp2_close_pct * 100:.0f}%, doi SL len TP1 "
+                        f"({sig['sl']:.6g}), bat dau trailing")
+                    append_jsonl(self.cfg.resolve_path(self.cfg.log_path), {
+                        "ts": now, "symbol": sym, "event": "hit_TP2", "price": price,
+                    })
+                    self._save_active_signals()
+                    continue
+
+            if stage >= 2:
+                trail_dist = self.cfg.trail_atr4h_mult * sig.get("atr4h", 0.0)
+                if trail_dist:
+                    if long:
+                        new_sl = price - trail_dist
+                        if new_sl > sig["sl"]:
+                            sig["sl"] = new_sl
+                    else:
+                        new_sl = price + trail_dist
+                        if new_sl < sig["sl"]:
+                            sig["sl"] = new_sl
+
+                hit_tp3 = (price >= sig["tp3"]) if long else (price <= sig["tp3"])
+                if hit_tp3:
+                    self.bot.send_message(
+                        f"<b>{sym}</b> {direction.upper()} cham TP3 tai {price:.6g} -> "
+                        f"chot toan bo")
+                    append_jsonl(self.cfg.resolve_path(self.cfg.log_path), {
+                        "ts": now, "symbol": sym, "event": "hit_TP3", "price": price,
+                    })
+                    expired.append(sym)
+                    continue
+
+            if now - sig["created_at"] > self.cfg.signal_ttl_seconds:
                 self.bot.send_message(
-                    f"<b>{sym}</b> {direction.upper()} da cham <b>{hit}</b> tai {price:.6g} "
-                    f"(entry {sig['entry_price']:.6g}) | PnL: {pnl_pct:+.2f}%")
+                    f"<b>{sym}</b> {direction.upper()} het TTL o stage {sig['stage']}, "
+                    f"gia hien tai {price:.6g}")
                 append_jsonl(self.cfg.resolve_path(self.cfg.log_path), {
-                    "ts": now, "symbol": sym, "event": f"hit_{hit}", "price": price,
-                    "entry": sig["entry_price"], "pnl_pct": pnl_pct,
+                    "ts": now, "symbol": sym, "event": f"ttl_expired_stage{sig['stage']}",
+                    "price": price,
                 })
                 expired.append(sym)
-            elif now - sig["created_at"] > self.cfg.signal_ttl_seconds:
-                # Da khop nhung het TTL ma khong cham SL lan TP -> dong ke o
-                # trang thai "het han", bao Telegram kem PnL uoc tinh (mark-to-market)
-                # de khong mat dau vet kèo nay.
-                pnl_pct = _pnl_pct(direction, sig["entry_price"], price)
-                self.bot.send_message(
-                    f"<b>{sym}</b> {direction.upper()} het han (khong cham SL/TP), "
-                    f"dong theo dõi tai {price:.6g} (entry {sig['entry_price']:.6g}) | "
-                    f"PnL uoc tinh: {pnl_pct:+.2f}%")
-                append_jsonl(self.cfg.resolve_path(self.cfg.log_path), {
-                    "ts": now, "symbol": sym, "event": "signal_expired", "price": price,
-                    "entry": sig["entry_price"], "pnl_pct": pnl_pct,
-                })
-                expired.append(sym)
+
         for sym in expired:
             self.active_signals.pop(sym, None)
+        self._save_active_signals()
 
     def _process_symbol(self, symbol: str, is_core: bool, is_ws: bool) -> Optional[dict]:
         """Chay trong 1 worker thread. Tra ve result dict hoac None neu loi.
@@ -310,19 +383,29 @@ class SignalEngine:
                     and result["score"] >= self.cfg.threshold and not on_cooldown):
                 entry_info = classify_entry(features, result, self.weights)
                 entry_price = entry_info["entry_price"]
-                sl, tp = suggested_sl_tp(entry_price, result["direction"], features["atr15m"])
-                self.bot.send_message(format_alert(features, result, entry_info, sl, tp))
+
+                # atr4h gio da duoc data.py.build_features() cung cap that (tinh
+                # tu klines_4h da fetch san cho bias_4h, khong ton them API call).
+                atr4h = features.get("atr4h", 0.0)
+
+                sltp = suggested_sl_tp_multi(
+                    entry_price, result["direction"], features["atr15m"], atr4h, self.cfg)
+
+                self.bot.send_message(format_alert(features, result, entry_info, sltp))
                 append_jsonl(self.cfg.resolve_path(self.cfg.log_path), {
                     "ts": now, "symbol": symbol, "direction": result["direction"],
                     "score": result["score"], "entry_type": entry_info["entry_type"],
-                    "entry": entry_price, "sl": sl, "tp": tp,
+                    "entry": entry_price, **sltp,
                 })
                 self.cooldowns[symbol] = now
                 self.active_signals[symbol] = {
                     "direction": result["direction"], "entry_price": entry_price,
-                    "entry_type": entry_info["entry_type"], "sl": sl, "tp": tp,
+                    "entry_type": entry_info["entry_type"],
+                    "sl": sltp["sl"], "tp1": sltp["tp1"], "tp2": sltp["tp2"], "tp3": sltp["tp3"],
+                    "atr4h": atr4h, "stage": 0,
                     "created_at": now, "filled": entry_info["entry_type"] == "MARKET",
                 }
+                self._save_active_signals()
 
         self._check_hits_and_expiry(current_prices)
 
@@ -330,6 +413,7 @@ class SignalEngine:
         if top5:
             lines = [f"{r['symbol']} {r['direction'].upper()} score={r['score']:.1f}" for r in top5]
             log.info("TOP 5: %s", " | ".join(lines))
+
         return results
 
     def run_forever(self) -> None:
