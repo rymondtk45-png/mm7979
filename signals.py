@@ -197,7 +197,7 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
 
     module_scores: Dict[str, float] = {}
     total = 0.0
-    max_possible = 0.0
+    active_weight = 0.0  # chi cong trong so cua module DA len tieng (raw != 0)
     votes_long = 0
     votes_short = 0
     for name in active_modules:
@@ -210,7 +210,14 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
         module_scores[name] = raw
         w = weights[name]
         total += raw * w
-        max_possible += w
+        if raw != 0.0:
+            # Nhieu module (absorption, funding_extreme, liquidity_sweep,
+            # long_short_ratio...) chi phat hien SU KIEN HIEM, mac dinh tra
+            # ve 0 khi khong co gi bat thuong -> day la "im lang" (abstain),
+            # KHONG phai "trung lap co y kien". Neu van cong trong so cua no
+            # vao mau so se lam loang diem cua nhung module dang dong thuan
+            # that su. Chi tinh mau so tren cac module da thuc su len tieng.
+            active_weight += w
         if raw > 0.05:
             votes_long += 1
         elif raw < -0.05:
@@ -243,7 +250,7 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
         total *= 0.75
         reasons.append(f"spoof_score {spoof_score:.2f} > 0.6 -> x0.75")
 
-    magnitude = abs(total) / max_possible if max_possible else 0.0
+    magnitude = abs(total) / active_weight if active_weight else 0.0
     score = max(0.0, min(100.0, magnitude * 100.0))
     confidence = magnitude
 
