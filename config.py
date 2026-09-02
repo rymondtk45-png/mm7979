@@ -72,7 +72,7 @@ class AppConfig:
         "EXCHANGES", ["BINANCE", "OKX", "BYBIT", "BINGX", "KUCOIN", "BITGET", "MEXC"]))
 
     poll_seconds: float = field(default_factory=lambda: _get_float("POLL_SECONDS", 20))
-    threshold: float = field(default_factory=lambda: _get_float("THRESHOLD", 62))
+    threshold: float = field(default_factory=lambda: _get_float("THRESHOLD", 65))
     use_futures: bool = field(default_factory=lambda: _get_bool("USE_FUTURES", True))
     alert_cooldown_seconds: int = field(default_factory=lambda: _get_int("ALERT_COOLDOWN_SECONDS", 900))
     enable_telegram: bool = field(default_factory=lambda: _get_bool("ENABLE_TELEGRAM", True))
@@ -81,7 +81,7 @@ class AppConfig:
 
     min_tf: str = field(default_factory=lambda: os.getenv("MIN_TF", "15m"))
     require_1h_align: bool = field(default_factory=lambda: _get_bool("REQUIRE_1H_ALIGN", True))
-    require_4h_align: bool = field(default_factory=lambda: _get_bool("REQUIRE_4H_ALIGN", False))
+    require_4h_align: bool = field(default_factory=lambda: _get_bool("REQUIRE_4H_ALIGN", True))
 
     log_path: str = field(default_factory=lambda: os.getenv("LOG_PATH", "logs/signals.jsonl"))
     feature_log_path: str = field(default_factory=lambda: os.getenv("FEATURE_LOG_PATH", "logs/features.jsonl"))

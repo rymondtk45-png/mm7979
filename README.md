@@ -100,11 +100,14 @@ dang WS.
   ly do `"veto: HTF conflict"`.
 - **`REQUIRE_1H_ALIGN=true`** (mac dinh): chi alert khi 15m VA 1h cung huong.
   Neu 15m di truoc mot minh (1h con neutral hoac nguoc) → khong alert.
-- **`REQUIRE_4H_ALIGN=false`** (mac dinh): neu bat, bat buoc 4h cung huong
-  voi 15m/1h moi duoc alert.
+- **`REQUIRE_4H_ALIGN=true`** (mac dinh, da siet lai): bat buoc 4h cung
+  huong voi 15m/1h moi duoc alert — loc bot tin hieu chi dung "an theo" 1
+  khung ngan, giam ty le dinh SL som.
 - Neu 4h cung huong voi tin hieu → nhan score voi **1.15**.
 - Sweep: pha vo high/low cua **20 nen 15m** hoac **12 nen 1h** truoc do.
-- SL/TP goi y tu **ATR15m**: SL = entry ∓ 0.8×ATR, TP = entry ± 1.5×ATR.
+- SL/TP goi y tu **ATR15m**: SL = entry ∓ 1.2×ATR, TP = entry ± 2.4×ATR
+  (R:R = 2.0, thay cho ban cu SL 0.8×/TP 1.5× ~R:R 1.9) — SL rong vua phai
+  de tranh bi quet boi nhieu, TP xa hon de "thua it thang nhieu".
 - Regime (accumulation / trending / high_volatility) lay tu khung **1h**.
 
 ## 6. Composite score + veto
@@ -120,14 +123,22 @@ Thu tu tinh:
 2. `score = sum(module_score * weight)`, chuan hoa ve 0–100 theo bien do.
 3. 4h aligned → nhan 1.15.
 4. `spoof_score > 0.6` (proxy tu pull_ratio_3s cua order book) → nhan 0.75.
-5. So phieu long/short tu cac module: neu chenh lech `<= 1` → veto "mixed".
-6. Sweep chi duoc tinh diem khi co tape confirm (cum >=3 lenh lon cung phia
+5. **Dong thuan module (da siet lai):** can **it nhat 4 module** co y kien
+   (raw > 0.05 hoac < -0.05) **VA** chenh lech phieu long/short **>= 3**,
+   neu khong se veto "weak consensus". Ban cu chi can chenh lech > 1 nen lot
+   nhieu tin hieu "mong manh" du chi 2 module co y kien — day la nguyen
+   nhan chinh khien SL bi dinh nhieu truoc day.
+6. `THRESHOLD` mac dinh nang tu **62 → 65**: it tin hieu hon nhung diem so
+   phai cao, tuc nhieu module + nhieu trong so dong thuan that su.
+7. Sweep chi duoc tinh diem khi co tape confirm (cum >=3 lenh lon cung phia
    trong 30s, cung huong voi sweep).
-7. Cross-exchange divergence chi la boi canh (trong so thap 0.5), khong tu
+8. Cross-exchange divergence chi la boi canh (trong so thap 0.5), khong tu
    gate huong mot minh.
-8. `ENABLE_MARKET_INTEL_SCORING=false` → chi dung 4 module "co dien" kieu
-   bot7979 (volume_profile, tape_flow, liquidation_impulse, funding_extreme)
-   nhung **van giu nguyen luat khung HTF** o muc 5.
+9. `ENABLE_MARKET_INTEL_SCORING=true` (mac dinh): dung DAY DU 12 module co
+   trong so trong `weights.json` (khong chi 4 module "co dien"). Chi khi
+   dat `ENABLE_MARKET_INTEL_SCORING=false` moi rut ve 4 module kieu bot7979
+   (volume_profile, tape_flow, liquidation_impulse, funding_extreme), nhung
+   **van giu nguyen luat khung HTF** o muc 5.
 
 ## 7. Heuristic iceberg/spoof va absorption (proxy, khong phai su that tuyet doi)
 
