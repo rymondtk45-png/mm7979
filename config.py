@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -121,7 +122,11 @@ def append_jsonl(path, obj: dict) -> None:
 def get_logger(name: str) -> logging.Logger:
     logger = logging.getLogger(name)
     if not logger.handlers:
-        handler = logging.StreamHandler()
+        # QUAN TRONG: StreamHandler() khong truyen stream se mac dinh ghi ra
+        # stderr -> cac nen tang log nhu Railway se gan severity=error cho
+        # MOI dong log (ke ca INFO binh thuong). Ep ghi ra stdout de log
+        # INFO hien thi dung muc INFO.
+        handler = logging.StreamHandler(stream=sys.stdout)
         fmt = logging.Formatter("%(asctime)s | %(levelname)-7s | %(name)s | %(message)s")
         handler.setFormatter(fmt)
         logger.addHandler(handler)
