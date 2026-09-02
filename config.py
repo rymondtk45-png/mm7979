@@ -68,6 +68,10 @@ class AppConfig:
     universe_refresh_seconds: int = field(default_factory=lambda: _get_int("UNIVERSE_REFRESH_SECONDS", 60))
     exchanges: List[str] = field(default_factory=lambda: _get_list(
         "EXCHANGES", ["BINANCE", "OKX", "BYBIT", "BINGX", "KUCOIN", "BITGET", "MEXC"]))
+    # Timeout (giay) cho moi request cross-exchange (chi ap dung CORE_SYMBOLS).
+    # Bi thieu truoc day -> AttributeError moi vong quet BTC/ETH/SOL, khien 3
+    # symbol nay luon loi va bi loai khoi ket qua composite/TOP5.
+    cross_exchange_timeout: float = field(default_factory=lambda: _get_float("CROSS_EXCHANGE_TIMEOUT", 5.0))
 
     # --- Full-model-for-all-pairs ---
     full_data_all: bool = field(default_factory=lambda: _get_bool("FULL_DATA_ALL", True))
