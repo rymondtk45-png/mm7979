@@ -12,6 +12,91 @@ from config import AppConfig
 
 LEGACY_MODULES = ["volume_profile", "tape_flow", "liquidation_impulse", "funding_extreme"]
 
+# --------------------------------------------------------------------------
+# Phan loai LIMIT vs MARKET theo BAN CHAT cua module dang dan dat tin hieu
+# --------------------------------------------------------------------------
+# MOMENTUM: gia dang chay theo huong tin hieu NGAY LUC NAY (aggression/breakout/
+# cascade dang xay ra). Cho retest = de mat edge hoac mat hang -> MARKET.
+MOMENTUM_MODULES = {"tape_flow", "taker_buy_sell_ratio", "liquidity_sweep", "liquidation_impulse"}
+
+# STRUCTURE: tin hieu dua tren 1 vung gia/muc thanh khoan cu the (POC, sach lenh
+# ben vung) - gia thuong quay lai test vung do truoc khi di tiep -> LIMIT tai vung.
+STRUCTURE_MODULES = {"volume_profile", "absorption", "persistent_book", "order_book_imbalance"}
+
+# MEAN-REVERSION: tin hieu contrarian tu trang thai qua mua/qua ban (funding,
+# basis, LSR, chenh lech gia lien san) - dien bien cham, khong can vao ngay,
+# thuong co du thoi gian cho gia lui ve muc tot hon -> LIMIT.
+MEANREV_MODULES = {"funding_extreme", "basis_spread", "long_short_ratio", "cross_exchange_divergence"}
+
+
+def classify_entry(f: dict, result: dict, weights: Dict[str, float]) -> dict:
+    """
+    Quyet dinh LIMIT hay MARKET dua tren TOAN BO dong gop cua cac module (khong
+    chi module manh nhat) - so sanh tong dong gop (raw*weight, cung chieu voi
+    huong tin hieu cuoi cung) cua nhom MOMENTUM vs nhom STRUCTURE+MEAN-REVERSION.
+    Regime va spoof_score dieu chinh nhe theo boi canh (high_volatility day ve
+    MARKET, accumulation/spoof nghi ngo day ve LIMIT).
+
+    Tra ve dict: entry_type (MARKET/LIMIT), entry_price, reason.
+    """
+    direction = result.get("direction", "neutral")
+    last_price = f.get("last_price", 0.0)
+    if direction == "neutral" or not last_price:
+        return {"entry_type": "MARKET", "entry_price": last_price, "reason": "khong co huong ro rang"}
+
+    sign = 1.0 if direction == "long" else -1.0
+    module_scores = result.get("module_scores", {})
+
+    momentum_contrib = 0.0
+    structure_contrib = 0.0
+    for name, raw in module_scores.items():
+        contrib = raw * weights.get(name, 0.0)
+        if contrib * sign <= 0:
+            continue  # chi tinh dong gop CUNG huong voi tin hieu cuoi cung
+        if name in MOMENTUM_MODULES:
+            momentum_contrib += abs(contrib)
+        elif name in STRUCTURE_MODULES or name in MEANREV_MODULES:
+            structure_contrib += abs(contrib)
+
+    regime = f.get("regime", "")
+    spoof = f.get("spoof_score", 0.0)
+    if regime == "high_volatility":
+        momentum_contrib *= 1.15
+    elif regime == "accumulation":
+        structure_contrib *= 1.15
+    if spoof > 0.6:
+        # sach lenh nghi bi gia lap -> khong nen duoi gia bang market
+        structure_contrib *= 1.3
+
+    atr = f.get("atr15m", 0.0)
+    poc = f.get("volume_profile", {}).get("poc", 0.0)
+
+    if momentum_contrib >= structure_contrib or not atr:
+        return {
+            "entry_type": "MARKET",
+            "entry_price": last_price,
+            "reason": f"momentum {momentum_contrib:.2f} >= structure {structure_contrib:.2f}",
+        }
+
+    # LIMIT: uu tien neo vao POC (vung volume/thanh khoan) neu POC nam trong
+    # 1.2x ATR va dung phia can cho gia lui ve; khong thi lui theo ATR (0.35x).
+    pullback = 0.35 * atr
+    if direction == "long":
+        use_poc = poc and poc <= last_price and (last_price - poc) <= 1.2 * atr
+        anchor = poc if use_poc else (last_price - pullback)
+        entry_price = min(anchor, last_price)
+    else:
+        use_poc = poc and poc >= last_price and (poc - last_price) <= 1.2 * atr
+        anchor = poc if use_poc else (last_price + pullback)
+        entry_price = max(anchor, last_price)
+
+    return {
+        "entry_type": "LIMIT",
+        "entry_price": entry_price,
+        "reason": f"structure {structure_contrib:.2f} > momentum {momentum_contrib:.2f}"
+                  + (" (neo POC)" if 'use_poc' in locals() and use_poc else " (lui theo ATR)"),
+    }
+
 
 def htf_check(bias_15m: str, bias_1h: str, bias_4h: str, cfg: AppConfig) -> Tuple[bool, str]:
     """
@@ -197,7 +282,7 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
 
     module_scores: Dict[str, float] = {}
     total = 0.0
-    active_weight = 0.0  # chi cong trong so cua module DA len tieng (raw != 0)
+    max_possible = 0.0
     votes_long = 0
     votes_short = 0
     for name in active_modules:
@@ -210,32 +295,17 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
         module_scores[name] = raw
         w = weights[name]
         total += raw * w
-        if raw != 0.0:
-            # Nhieu module (absorption, funding_extreme, liquidity_sweep,
-            # long_short_ratio...) chi phat hien SU KIEN HIEM, mac dinh tra
-            # ve 0 khi khong co gi bat thuong -> day la "im lang" (abstain),
-            # KHONG phai "trung lap co y kien". Neu van cong trong so cua no
-            # vao mau so se lam loang diem cua nhung module dang dong thuan
-            # that su. Chi tinh mau so tren cac module da thuc su len tieng.
-            active_weight += w
+        max_possible += w
         if raw > 0.05:
             votes_long += 1
         elif raw < -0.05:
             votes_short += 1
 
-    total_votes = votes_long + votes_short
-    vote_margin = abs(votes_long - votes_short)
-    # Dong thuan phai RO RANG: can >=4 module co y kien VA lech >=3 phieu
-    # (truoc day chi can lech >1 phieu, de lot nhieu tin hieu "mong manh"
-    # -> hay bi quet SL). Sieu chat de giam so luong nhung tang chat luong.
-    if total_votes == 0 or total_votes < 4 or vote_margin < 3:
-        reasons.append(
-            f"veto: dong thuan yeu (votes long={votes_long} short={votes_short}, "
-            f"can >=4 module va lech >=3)"
-        )
+    if abs(votes_long - votes_short) <= 1 and (votes_long + votes_short) > 0:
+        reasons.append("veto: mixed (vote long/short chenh <=1)")
         return {
             "score": 0.0, "direction": "neutral", "confidence": 0.0,
-            "reasons": reasons, "veto": True, "veto_reason": "weak consensus",
+            "reasons": reasons, "veto": True, "veto_reason": "mixed votes",
             "module_scores": module_scores,
         }
 
@@ -250,7 +320,7 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
         total *= 0.75
         reasons.append(f"spoof_score {spoof_score:.2f} > 0.6 -> x0.75")
 
-    magnitude = abs(total) / active_weight if active_weight else 0.0
+    magnitude = abs(total) / max_possible if max_possible else 0.0
     score = max(0.0, min(100.0, magnitude * 100.0))
     confidence = magnitude
 
@@ -273,20 +343,11 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
 
 
 def suggested_sl_tp(entry: float, direction: str, atr15m: float) -> Tuple[float, float]:
-    """SL/TP tu ATR15m: SL = 1.2*ATR, TP = 2.4*ATR (R:R = 2.0).
-
-    So voi ban cu (SL 0.8*ATR, TP 1.5*ATR, R:R ~1.9):
-    - SL noi rong hon (0.8 -> 1.2) de bot khong bi quet stop qua som boi
-      nhieu gia binh thuong trong bien do ATR15m, nhung van du sat de
-      khong "loang" rui ro qua muc.
-    - TP keo dai hon (1.5 -> 2.4) de bat duoc nhip di xa hon.
-    - Ty le R:R duoc nang tu ~1.9 len dung 2.0 -> toi uu ky vong loi nhuan
-      tren moi lenh (win rate can >= ~33% de hoa von thay vi ~35% truoc).
-    """
+    """SL/TP tu ATR15m: SL = 0.8*ATR, TP = 1.5*ATR."""
     if direction == "long":
-        return entry - 1.2 * atr15m, entry + 2.4 * atr15m
+        return entry - 0.8 * atr15m, entry + 1.5 * atr15m
     if direction == "short":
-        return entry + 1.2 * atr15m, entry - 2.4 * atr15m
+        return entry + 0.8 * atr15m, entry - 1.5 * atr15m
     return entry, entry
 
 

@@ -51,14 +51,90 @@ def _session() -> requests.Session:
 SESSION = _session()
 
 
-def safe_get(url: str, params: dict = None, timeout: float = 5.0) -> Optional[dict]:
-    try:
-        r = SESSION.get(url, params=params, timeout=timeout)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:  # noqa: BLE001
-        log.warning("GET fail %s : %s", url, e)
-        return None
+class WeightLimiter:
+    """Token-bucket theo 'request weight' cua Binance (gioi han that: 2400/phut/IP).
+    Chu dong sleep truoc khi vuot ngan sach, thay vi de dinh 429/418 roi moi xu ly.
+    Thread-safe, dung chung cho moi worker."""
+
+    def __init__(self, budget_per_min: int = 2000):
+        self.budget = max(budget_per_min, 100)
+        self.used = 0
+        self.window_start = time.time()
+        self._lock = threading.Lock()
+
+    def set_budget(self, budget_per_min: int) -> None:
+        with self._lock:
+            self.budget = max(budget_per_min, 100)
+
+    def acquire(self, weight: int = 1) -> None:
+        while True:
+            with self._lock:
+                now = time.time()
+                if now - self.window_start >= 60:
+                    self.window_start = now
+                    self.used = 0
+                if self.used + weight <= self.budget:
+                    self.used += weight
+                    return
+                sleep_for = max(60 - (now - self.window_start), 0.05)
+            time.sleep(min(sleep_for, 2.0))
+
+    def penalize(self, seconds: float) -> None:
+        """Goi khi dinh 429/418: coi nhu het ngan sach cho toi het cua so hien tai."""
+        with self._lock:
+            self.used = self.budget
+            self.window_start = time.time() - 60 + seconds
+
+
+WEIGHT_LIMITER = WeightLimiter(2000)
+
+
+def init_rate_limiter(cfg: "AppConfig") -> None:
+    WEIGHT_LIMITER.set_budget(cfg.weight_budget_per_min)
+
+
+class TTLCache:
+    """Cache don gian keyed theo (symbol, kind), moi entry co TTL rieng luc ghi."""
+
+    def __init__(self):
+        self._store: Dict[str, Tuple[float, float, object]] = {}
+        self._lock = threading.Lock()
+
+    def get(self, key: str):
+        with self._lock:
+            entry = self._store.get(key)
+            if not entry:
+                return None
+            ts, ttl, value = entry
+            if time.time() - ts > ttl:
+                return None
+            return value
+
+    def set(self, key: str, value, ttl: float) -> None:
+        with self._lock:
+            self._store[key] = (time.time(), ttl, value)
+
+
+REST_CACHE = TTLCache()
+
+
+def safe_get(url: str, params: dict = None, timeout: float = 5.0, weight: int = 1) -> Optional[dict]:
+    for attempt in range(3):
+        WEIGHT_LIMITER.acquire(weight)
+        try:
+            r = SESSION.get(url, params=params, timeout=timeout)
+            if r.status_code in (418, 429):
+                retry_after = float(r.headers.get("Retry-After", 5))
+                log.warning("Rate limited (%s) tren %s, cho %.1fs", r.status_code, url, retry_after)
+                WEIGHT_LIMITER.penalize(retry_after)
+                time.sleep(retry_after)
+                continue
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:  # noqa: BLE001
+            log.warning("GET fail %s : %s", url, e)
+            return None
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -355,18 +431,29 @@ class UniverseManager:
         with self._lock:
             return list(self.scan_set)
 
-    def ws_symbols(self, max_extra: int = 15) -> List[str]:
-        """CORE + toi da max_extra cap dau scan set (khong trung CORE)."""
+    def ws_symbols(self, max_extra: int = None) -> List[str]:
+        """CORE + toi da max_extra cap dau scan set (khong trung CORE).
+        Neu max_extra=None: dung cfg.ws_cover_all de quyet dinh phu toan bo
+        scan set (full model) hay chi 15 cap dau (nhe, tiet kiem WS/CPU)."""
         with self._lock:
             core = list(self.cfg.core_symbols)
+            if max_extra is None:
+                max_extra = len(self.scan_set) if self.cfg.ws_cover_all else 15
             extra = [s for s in self.scan_set if s not in core][:max_extra]
             return core + extra
 
 
-def fetch_klines(symbol: str, interval: str, limit: int = 60) -> List[dict]:
+def fetch_klines(symbol: str, interval: str, limit: int = 60, cache_ttl: float = 0.0) -> List[dict]:
+    """weight=1 (limit<=100 tren fapi). cache_ttl>0 -> dung TTLCache (cho 1h/4h,
+    khong can lay lai moi vong quet vi nen HTF khong doi nhanh)."""
+    cache_key = f"klines:{symbol}:{interval}:{limit}"
+    if cache_ttl > 0:
+        cached = REST_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
     raw = safe_get(f"{FAPI}/fapi/v1/klines", params={
         "symbol": symbol, "interval": interval, "limit": limit,
-    })
+    }, weight=1)
     out = []
     if not raw:
         return out
@@ -381,11 +468,15 @@ def fetch_klines(symbol: str, interval: str, limit: int = 60) -> List[dict]:
             })
         except (IndexError, ValueError, TypeError):
             continue
+    if cache_ttl > 0 and out:
+        REST_CACHE.set(cache_key, out, cache_ttl)
     return out
 
 
 def fetch_agg_trades(symbol: str, limit: int = 500) -> List[dict]:
-    raw = safe_get(f"{FAPI}/fapi/v1/aggTrades", params={"symbol": symbol, "limit": limit})
+    """weight=20 tren futures - dat nhat trong toan bo cac endpoint dung.
+    Chi nen goi khi seed lan dau cho 1 symbol chua co WS tape."""
+    raw = safe_get(f"{FAPI}/fapi/v1/aggTrades", params={"symbol": symbol, "limit": limit}, weight=20)
     out = []
     if not raw:
         return out
@@ -398,7 +489,8 @@ def fetch_agg_trades(symbol: str, limit: int = 500) -> List[dict]:
 
 
 def fetch_depth(symbol: str, limit: int = 20) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
-    raw = safe_get(f"{FAPI}/fapi/v1/depth", params={"symbol": symbol, "limit": limit})
+    """weight=2 cho limit<=50 tren futures."""
+    raw = safe_get(f"{FAPI}/fapi/v1/depth", params={"symbol": symbol, "limit": limit}, weight=2)
     if not raw:
         return [], []
     bids = [(float(p), float(q)) for p, q in raw.get("bids", [])]
@@ -406,46 +498,70 @@ def fetch_depth(symbol: str, limit: int = 20) -> Tuple[List[Tuple[float, float]]
     return bids, asks
 
 
-def fetch_funding(symbol: str) -> Optional[float]:
-    raw = safe_get(f"{FAPI}/fapi/v1/premiumIndex", params={"symbol": symbol})
-    if not raw:
-        return None
-    try:
-        return float(raw.get("lastFundingRate", 0.0))
-    except (TypeError, ValueError):
-        return None
+def fetch_premium_index(symbol: str, cache_ttl: float = 0.0) -> dict:
+    """1 call duy nhat cho ca funding + mark + index (thay vi goi premiumIndex 2 lan
+    nhu truoc: fetch_funding va fetch_mark_index tach roi). weight=1. Cache TTL
+    vi funding chi doi moi 8h, mark/index doi nhanh hon nhung khong can moi 20-25s."""
+    cache_key = f"premium:{symbol}"
+    if cache_ttl > 0:
+        cached = REST_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+    raw = safe_get(f"{FAPI}/fapi/v1/premiumIndex", params={"symbol": symbol}, weight=1)
+    result = {"funding": None, "mark": None, "index": None}
+    if raw:
+        try:
+            result["funding"] = float(raw.get("lastFundingRate", 0.0))
+        except (TypeError, ValueError):
+            pass
+        try:
+            result["mark"] = float(raw.get("markPrice"))
+            result["index"] = float(raw.get("indexPrice"))
+        except (TypeError, ValueError):
+            pass
+    if cache_ttl > 0:
+        REST_CACHE.set(cache_key, result, cache_ttl)
+    return result
 
 
-def fetch_mark_index(symbol: str) -> Tuple[Optional[float], Optional[float]]:
-    raw = safe_get(f"{FAPI}/fapi/v1/premiumIndex", params={"symbol": symbol})
-    if not raw:
-        return None, None
-    try:
-        return float(raw.get("markPrice")), float(raw.get("indexPrice"))
-    except (TypeError, ValueError):
-        return None, None
+def fetch_open_interest(symbol: str, cache_ttl: float = 0.0) -> Optional[float]:
+    """weight=1."""
+    cache_key = f"oi:{symbol}"
+    if cache_ttl > 0:
+        cached = REST_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+    raw = safe_get(f"{FAPI}/fapi/v1/openInterest", params={"symbol": symbol}, weight=1)
+    val = None
+    if raw:
+        try:
+            val = float(raw.get("openInterest"))
+        except (TypeError, ValueError):
+            val = None
+    if cache_ttl > 0 and val is not None:
+        REST_CACHE.set(cache_key, val, cache_ttl)
+    return val
 
 
-def fetch_open_interest(symbol: str) -> Optional[float]:
-    raw = safe_get(f"{FAPI}/fapi/v1/openInterest", params={"symbol": symbol})
-    if not raw:
-        return None
-    try:
-        return float(raw.get("openInterest"))
-    except (TypeError, ValueError):
-        return None
-
-
-def fetch_long_short_ratio(symbol: str) -> Optional[float]:
+def fetch_long_short_ratio(symbol: str, cache_ttl: float = 0.0) -> Optional[float]:
+    """weight=1."""
+    cache_key = f"lsr:{symbol}"
+    if cache_ttl > 0:
+        cached = REST_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
     raw = safe_get(f"{FAPI}/futures/data/topLongShortPositionRatio", params={
         "symbol": symbol, "period": "15m", "limit": 1,
-    })
-    if not raw:
-        return None
-    try:
-        return float(raw[0].get("longShortRatio"))
-    except (IndexError, KeyError, TypeError, ValueError):
-        return None
+    }, weight=1)
+    val = None
+    if raw:
+        try:
+            val = float(raw[0].get("longShortRatio"))
+        except (IndexError, KeyError, TypeError, ValueError):
+            val = None
+    if cache_ttl > 0 and val is not None:
+        REST_CACHE.set(cache_key, val, cache_ttl)
+    return val
 
 
 def fetch_cross_exchange_price(exchange: str, symbol: str) -> Optional[float]:
@@ -613,23 +729,27 @@ class LocalBook:
 
 
 class LiquidationTape:
-    """Tich luy thanh ly tu WS @forceOrder."""
+    """Tich luy thanh ly tu WS @forceOrder, theo tung symbol.
+    Truoc day gop chung tat ca symbol vao 1 tong duy nhat (chi dung tam khi
+    con it symbol CORE); voi 200 cap can tach rieng de moi cap co so lieu dung
+    cho chinh no."""
 
     def __init__(self, window_seconds: int = 3600):
         self.window_seconds = window_seconds
-        self.events: Deque[dict] = deque()
+        self.events: Dict[str, Deque[dict]] = {}
         self._lock = threading.Lock()
 
-    def add_event(self, side: str, usd: float, ts: int) -> None:
+    def add_event(self, symbol: str, side: str, usd: float, ts: int) -> None:
         with self._lock:
-            self.events.append({"side": side, "usd": usd, "ts": ts})
+            dq = self.events.setdefault(symbol, deque())
+            dq.append({"side": side, "usd": usd, "ts": ts})
             cutoff = ts - self.window_seconds * 1000
-            while self.events and self.events[0]["ts"] < cutoff:
-                self.events.popleft()
+            while dq and dq[0]["ts"] < cutoff:
+                dq.popleft()
 
-    def totals(self) -> dict:
+    def totals(self, symbol: str) -> dict:
         with self._lock:
-            events = list(self.events)
+            events = list(self.events.get(symbol, ()))
         long_liq = sum(e["usd"] for e in events if e["side"] == "long")
         short_liq = sum(e["usd"] for e in events if e["side"] == "short")
         now = events[-1]["ts"] if events else int(time.time() * 1000)
@@ -683,19 +803,25 @@ class StreamHub:
         if websocket is None:
             log.warning("websocket-client chua duoc cai, bo qua WS, dung REST fallback")
             return
-        public_streams = []
-        market_streams = []
-        for s in symbols:
-            sym = s.lower()
-            public_streams += [f"{sym}@bookTicker", f"{sym}@depth20@100ms"]
-            market_streams += [f"{sym}@aggTrade", f"{sym}@forceOrder", f"{sym}@markPrice@1s"]
-        t1 = threading.Thread(target=self._run, args=(WS_PUBLIC + "/".join(public_streams), self._on_public),
-                               daemon=True)
-        t2 = threading.Thread(target=self._run, args=(WS_MARKET + "/".join(market_streams), self._on_market),
-                               daemon=True)
-        t1.start()
-        t2.start()
-        self._threads = [t1, t2]
+        chunk_size = max(getattr(self.cfg, "ws_chunk_size", 40), 1)
+        self._threads = []
+        for i in range(0, len(symbols), chunk_size):
+            group = symbols[i:i + chunk_size]
+            public_streams = []
+            market_streams = []
+            for s in group:
+                sym = s.lower()
+                public_streams += [f"{sym}@bookTicker", f"{sym}@depth20@100ms"]
+                market_streams += [f"{sym}@aggTrade", f"{sym}@forceOrder", f"{sym}@markPrice@1s"]
+            t1 = threading.Thread(
+                target=self._run, args=(WS_PUBLIC + "/".join(public_streams), self._on_public), daemon=True)
+            t2 = threading.Thread(
+                target=self._run, args=(WS_MARKET + "/".join(market_streams), self._on_market), daemon=True)
+            t1.start()
+            t2.start()
+            self._threads += [t1, t2]
+        log.info("StreamHub: %d symbol chia thanh %d connection-pair (chunk=%d)",
+                  len(symbols), len(self._threads) // 2, chunk_size)
 
     def stop(self) -> None:
         self._stop.set()
@@ -763,7 +889,7 @@ class StreamHub:
                 # forceOrder SELL = thanh ly vi the LONG; BUY = thanh ly vi the SHORT
                 usd = float(o.get("ap", 0.0) or o.get("p", 0.0)) * float(o.get("q", 0.0))
                 if sym:
-                    self.liq.add_event(side, usd, int(data.get("E", time.time() * 1000)))
+                    self.liq.add_event(sym, side, usd, int(data.get("E", time.time() * 1000)))
             elif "@markPrice" in stream:
                 sym = data.get("s")
                 if sym and data.get("p"):
@@ -827,9 +953,9 @@ def build_features(symbol: str, cfg: AppConfig, ctx: MarketContext, is_core: boo
     ctx.ensure_symbol(symbol)
     now_ms = int(time.time() * 1000)
 
-    klines_15m = fetch_klines(symbol, "15m", limit=40)
-    klines_1h = fetch_klines(symbol, "1h", limit=30)
-    klines_4h = fetch_klines(symbol, "4h", limit=20)
+    klines_15m = fetch_klines(symbol, "15m", limit=40)  # luon fresh, khong cache
+    klines_1h = fetch_klines(symbol, "1h", limit=30, cache_ttl=cfg.htf_1h_cache_seconds)
+    klines_4h = fetch_klines(symbol, "4h", limit=20, cache_ttl=cfg.htf_4h_cache_seconds)
 
     bias_15m = bias_from_klines(klines_15m, 20)
     bias_1h = bias_from_klines(klines_1h, 12)
@@ -881,13 +1007,33 @@ def build_features(symbol: str, cfg: AppConfig, ctx: MarketContext, is_core: boo
     absorption = detect_absorption(cvd_5m, price_move_pct, persist)
     spoof_score = pull_ratio if is_ws_tracked else 0.0
 
-    liq_totals = ctx.liq.totals() if is_core else {
+    # full_data_all: bat 4 module "nang" (funding/basis/OI/LSR/liquidation) cho
+    # TOAN BO cap trong scan set, khong chi rieng CORE. Dung cache TTL de khong
+    # phai goi lai moi vong quet (funding chi doi moi 8h tren Binance, OI/LSR
+    # cung khong can lay lai moi 20-25s) -> giu weight budget an toan.
+    use_full = is_core or cfg.full_data_all
+    use_cross = is_core or cfg.cross_exchange_all
+
+    liq_totals = ctx.liq.totals(symbol) if use_full else {
         "long_liq_usd": 0.0, "short_liq_usd": 0.0, "impulse_60s_long": 0.0, "impulse_60s_short": 0.0}
 
-    funding = fetch_funding(symbol) if is_core or is_ws_tracked else None
-    mark_price, index_price = fetch_mark_index(symbol) if is_core else (None, None)
-    open_interest = fetch_open_interest(symbol) if is_core else None
-    lsr = fetch_long_short_ratio(symbol) if is_core else None
+    funding = mark_price = index_price = None
+    if is_core:
+        # CORE: khong cache, luon lay moi nhat.
+        premium = fetch_premium_index(symbol)
+        funding, mark_price, index_price = premium["funding"], premium["mark"], premium["index"]
+    elif use_full or is_ws_tracked:
+        premium = fetch_premium_index(symbol, cache_ttl=cfg.funding_cache_seconds)
+        funding, mark_price, index_price = premium["funding"], premium["mark"], premium["index"]
+
+    open_interest = None
+    if use_full:
+        open_interest = fetch_open_interest(symbol, cache_ttl=0 if is_core else cfg.oi_cache_seconds)
+
+    lsr = None
+    if use_full:
+        lsr = fetch_long_short_ratio(symbol, cache_ttl=0 if is_core else cfg.lsr_cache_seconds)
+
     funding_z = ctx.funding_zscore(symbol, funding) if funding is not None else 0.0
 
     basis = 0.0
@@ -898,8 +1044,11 @@ def build_features(symbol: str, cfg: AppConfig, ctx: MarketContext, is_core: boo
     if klines_15m and klines_15m[-1]["volume"]:
         taker_ratio = klines_15m[-1]["taker_buy_base"] / klines_15m[-1]["volume"]
 
+    # cross_exchange_all mac dinh TAT: goi 6 san ngoai x 200 cap la chi phi/ rui ro
+    # cao nhat va it gia tri nhat cho alt (nhat la alt thanh khoan thap tren san
+    # khac). Neu can, bat qua bien moi truong CROSS_EXCHANGE_ALL=true.
     cross_divergence = 0.0
-    if is_core:
+    if use_cross:
         prices = []
         for ex in cfg.exchanges:
             if ex == "BINANCE":

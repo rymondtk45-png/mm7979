@@ -72,7 +72,21 @@ class AppConfig:
     exchanges: List[str] = field(default_factory=lambda: _get_list(
         "EXCHANGES", ["BINANCE", "OKX", "BYBIT", "BINGX", "KUCOIN", "BITGET", "MEXC"]))
 
-    poll_seconds: float = field(default_factory=lambda: _get_float("POLL_SECONDS", 20))
+    # --- Full-model-for-all-pairs ---
+    full_data_all: bool = field(default_factory=lambda: _get_bool("FULL_DATA_ALL", True))
+    cross_exchange_all: bool = field(default_factory=lambda: _get_bool("CROSS_EXCHANGE_ALL", False))
+    ws_cover_all: bool = field(default_factory=lambda: _get_bool("WS_COVER_ALL", True))
+    ws_chunk_size: int = field(default_factory=lambda: _get_int("WS_CHUNK_SIZE", 40))
+    max_workers: int = field(default_factory=lambda: _get_int("MAX_WORKERS", 12))
+    # Ngan sach weight/phut, de duoi gioi han that cua Binance Futures (2400/phut/IP)
+    weight_budget_per_min: int = field(default_factory=lambda: _get_int("WEIGHT_BUDGET_PER_MIN", 2000))
+    funding_cache_seconds: int = field(default_factory=lambda: _get_int("FUNDING_CACHE_SECONDS", 120))
+    oi_cache_seconds: int = field(default_factory=lambda: _get_int("OI_CACHE_SECONDS", 60))
+    lsr_cache_seconds: int = field(default_factory=lambda: _get_int("LSR_CACHE_SECONDS", 120))
+    htf_1h_cache_seconds: int = field(default_factory=lambda: _get_int("HTF_1H_CACHE_SECONDS", 180))
+    htf_4h_cache_seconds: int = field(default_factory=lambda: _get_int("HTF_4H_CACHE_SECONDS", 600))
+
+    poll_seconds: float = field(default_factory=lambda: _get_float("POLL_SECONDS", 25))
     threshold: float = field(default_factory=lambda: _get_float("THRESHOLD", 65))
     use_futures: bool = field(default_factory=lambda: _get_bool("USE_FUTURES", True))
     alert_cooldown_seconds: int = field(default_factory=lambda: _get_int("ALERT_COOLDOWN_SECONDS", 900))

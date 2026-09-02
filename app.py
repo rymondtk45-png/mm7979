@@ -7,13 +7,14 @@ from __future__ import annotations
 
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional
 
 import requests
 
 from config import AppConfig, append_jsonl, get_logger, load_weights
-from data import MarketContext, UniverseManager, build_features
-from signals import compute_composite, rank_top, suggested_sl_tp
+from data import MarketContext, UniverseManager, build_features, init_rate_limiter
+from signals import classify_entry, compute_composite, rank_top, suggested_sl_tp
 
 log = get_logger("app")
 
@@ -121,19 +122,25 @@ class TelegramBot:
         self._stop.set()
 
 
-def format_alert(f: dict, result: dict) -> str:
+def format_alert(f: dict, result: dict, entry_info: dict, sl: float, tp: float) -> str:
     direction = result["direction"].upper()
-    entry = f["last_price"]
-    sl, tp = suggested_sl_tp(entry, result["direction"], f["atr15m"])
+    entry_type = entry_info["entry_type"]
+    entry_price = entry_info["entry_price"]
     vp = f.get("volume_profile", {})
     reasons = "\n".join(f"• {r}" for r in result["reasons"])
     lsr = f.get("long_short_ratio")
     lsr_str = f"{lsr:.2f}" if lsr is not None else "n/a"
+    entry_line = (
+        f"Entry: {entry_price:.6g} MARKET (vao ngay)" if entry_type == "MARKET"
+        else f"Entry: {entry_price:.6g} LIMIT (cho khop, gia hien tai {f['last_price']:.6g})"
+    )
     return (
         f"<b>{f['symbol']} {direction}</b>\n"
         f"Module | Regime: {f['regime']}\n"
         f"Score: {result['score']:.1f} | Confidence: {result['confidence']:.2f}\n"
-        f"Entry: {entry:.6g} | SL: {sl:.6g} | TP: {tp:.6g}\n"
+        f"{entry_line}\n"
+        f"SL: {sl:.6g} | TP: {tp:.6g}\n"
+        f"Ly do entry: {entry_info['reason']}\n"
         f"HTF 15m/1h/4h: {f['bias_15m']}/{f['bias_1h']}/{f['bias_4h']}\n"
         f"POC15m: {vp.get('poc', 0):.6g} | CVD5m: {f['cvd_5m']:.2f} | spoof: {f['spoof_score']:.2f}\n"
         f"Long/Short ratio: {lsr_str}\n"
@@ -150,11 +157,16 @@ class SignalEngine:
         self.bot = TelegramBot(cfg, self.universe)
         self.cooldowns: Dict[str, float] = {}
         self.active_signals: Dict[str, dict] = {}
+        self._state_lock = threading.Lock()
         self._stop = threading.Event()
+        init_rate_limiter(cfg)
 
     def start(self) -> None:
         self.universe.refresh(force=True)
-        ws_syms = self.universe.ws_symbols(max_extra=15)
+        # ws_symbols() khong truyen max_extra -> dung cfg.ws_cover_all (mac dinh
+        # True = phu toan bo scan set, khong cap 15 nhu truoc).
+        ws_syms = self.universe.ws_symbols()
+        log.info("WS se theo doi %d/%d cap trong scan set", len(ws_syms), len(self.universe.get_scan_set()))
         self.ctx.start_stream(ws_syms)
         if self.cfg.enable_telegram and self.cfg.telegram_bot_token:
             threading.Thread(target=self.bot.poll_commands_forever, daemon=True).start()
@@ -174,6 +186,29 @@ class SignalEngine:
             if price is None:
                 continue
             direction = sig["direction"]
+
+            if not sig["filled"]:
+                # Kèo LIMIT: chua khop, chi theo doi xem gia da cham entry_price
+                # chua truoc khi bat dau tinh TP/SL. MARKET thi filled=True ngay
+                # tu luc tao nen khong bao gio vao nhanh nay.
+                touched = ((direction == "long" and price <= sig["entry_price"])
+                           or (direction == "short" and price >= sig["entry_price"]))
+                if touched:
+                    sig["filled"] = True
+                    self.bot.send_message(
+                        f"<b>{sym}</b> {direction.upper()} LIMIT da khop tai {price:.6g}")
+                    append_jsonl(self.cfg.resolve_path(self.cfg.log_path), {
+                        "ts": now, "symbol": sym, "event": "limit_filled", "price": price,
+                    })
+                elif now - sig["created_at"] > self.cfg.signal_ttl_seconds:
+                    # Limit cho qua lau khong khop -> huy, khong tinh la mot lenh da vao.
+                    append_jsonl(self.cfg.resolve_path(self.cfg.log_path), {
+                        "ts": now, "symbol": sym, "event": "limit_expired_unfilled",
+                    })
+                    expired.append(sym)
+                if not sig["filled"]:
+                    continue
+
             hit = None
             if direction == "long":
                 if price <= sig["sl"]:
@@ -197,47 +232,69 @@ class SignalEngine:
         for sym in expired:
             self.active_signals.pop(sym, None)
 
+    def _process_symbol(self, symbol: str, is_core: bool, is_ws: bool) -> Optional[dict]:
+        """Chay trong 1 worker thread. Tra ve result dict hoac None neu loi.
+        Khong dung chung state (cooldowns/active_signals) o day de tranh race
+        condition - xu ly state o thread chinh sau khi thu thap xong."""
+        try:
+            features = build_features(symbol, self.cfg, self.ctx, is_core, is_ws)
+            append_jsonl(self.cfg.resolve_path(self.cfg.feature_log_path), features)
+            result = compute_composite(features, self.weights, self.cfg)
+            result["symbol"] = symbol
+            result["features"] = features
+            return result
+        except Exception as e:  # noqa: BLE001
+            log.warning("Loi xu ly symbol %s: %s", symbol, e)
+            return None
+
     def run_once(self) -> List[dict]:
         self.universe.refresh(force=False)
         scan_set = self.universe.get_scan_set()
-        ws_set = set(self.universe.ws_symbols(max_extra=15))
+        ws_set = set(self.universe.ws_symbols())
         core_set = set(self.cfg.core_symbols)
 
-        results = []
+        results: List[dict] = []
         current_prices: Dict[str, float] = {}
-        for symbol in scan_set:
-            try:
-                is_core = symbol in core_set
-                is_ws = symbol in ws_set
-                features = build_features(symbol, self.cfg, self.ctx, is_core, is_ws)
-                current_prices[symbol] = features["last_price"]
-                append_jsonl(self.cfg.resolve_path(self.cfg.feature_log_path), features)
 
-                result = compute_composite(features, self.weights, self.cfg)
-                result["symbol"] = symbol
-                result["features"] = features
+        # Da luong co kiem soat: WeightLimiter (trong data.py) la nut that chung
+        # cho moi worker, dam bao tong weight/phut khong vuot ngan sach du chay
+        # bao nhieu thread. max_workers chi anh huong toc do "xep hang", khong
+        # anh huong toc do "goi API thuc te" - an toan de tang len khi can.
+        with ThreadPoolExecutor(max_workers=self.cfg.max_workers) as pool:
+            futures = {
+                pool.submit(self._process_symbol, symbol, symbol in core_set, symbol in ws_set): symbol
+                for symbol in scan_set
+            }
+            for future in as_completed(futures):
+                result = future.result()
+                if result is None:
+                    continue
                 results.append(result)
+                current_prices[result["symbol"]] = result["features"]["last_price"]
 
-                now = time.time()
-                on_cooldown = (now - self.cooldowns.get(symbol, 0)) < self.cfg.alert_cooldown_seconds
-                already_active = symbol in self.active_signals
-                if (not result["veto"] and result["direction"] != "neutral"
-                        and result["score"] >= self.cfg.threshold
-                        and not on_cooldown and not already_active):
-                    entry = features["last_price"]
-                    sl, tp = suggested_sl_tp(entry, result["direction"], features["atr15m"])
-                    self.bot.send_message(format_alert(features, result))
-                    append_jsonl(self.cfg.resolve_path(self.cfg.log_path), {
-                        "ts": now, "symbol": symbol, "direction": result["direction"],
-                        "score": result["score"], "entry": entry, "sl": sl, "tp": tp,
-                    })
-                    self.cooldowns[symbol] = now
-                    self.active_signals[symbol] = {
-                        "direction": result["direction"], "sl": sl, "tp": tp, "created_at": now,
-                    }
-            except Exception as e:  # noqa: BLE001
-                log.warning("Loi xu ly symbol %s: %s", symbol, e)
-            time.sleep(0.12)
+        # Xu ly alert/cooldown/active_signals tuan tu o thread chinh (tranh race).
+        now = time.time()
+        for result in results:
+            symbol = result["symbol"]
+            features = result["features"]
+            on_cooldown = (now - self.cooldowns.get(symbol, 0)) < self.cfg.alert_cooldown_seconds
+            if (not result["veto"] and result["direction"] != "neutral"
+                    and result["score"] >= self.cfg.threshold and not on_cooldown):
+                entry_info = classify_entry(features, result, self.weights)
+                entry_price = entry_info["entry_price"]
+                sl, tp = suggested_sl_tp(entry_price, result["direction"], features["atr15m"])
+                self.bot.send_message(format_alert(features, result, entry_info, sl, tp))
+                append_jsonl(self.cfg.resolve_path(self.cfg.log_path), {
+                    "ts": now, "symbol": symbol, "direction": result["direction"],
+                    "score": result["score"], "entry_type": entry_info["entry_type"],
+                    "entry": entry_price, "sl": sl, "tp": tp,
+                })
+                self.cooldowns[symbol] = now
+                self.active_signals[symbol] = {
+                    "direction": result["direction"], "entry_price": entry_price,
+                    "entry_type": entry_info["entry_type"], "sl": sl, "tp": tp,
+                    "created_at": now, "filled": entry_info["entry_type"] == "MARKET",
+                }
 
         self._check_hits_and_expiry(current_prices)
 
