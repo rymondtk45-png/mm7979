@@ -377,6 +377,44 @@ def suggested_sl_tp(entry: float, direction: str, atr15m: float) -> Tuple[float,
     return entry, entry
 
 
+def suggested_sl_tp_multi(entry: float, direction: str, atr15m: float, atr4h: float,
+                           cfg: AppConfig) -> dict:
+    """
+    SL + 3 tang TP, dung cho chien luoc chot lai tung phan trong
+    SignalEngine._check_hits_and_expiry (app.py): TP1 chot cfg.tp1_close_pct +
+    doi SL ve breakeven, TP2 chot them cfg.tp2_close_pct + doi SL len TP1 (bat
+    dau trailing theo cfg.trail_atr4h_mult * atr4h, xem app.py), TP3 la muc
+    tieu xa / trailing bat kip truoc do.
+
+    Dung DUNG cac field da co san trong AppConfig (config.py):
+      - SL bam ATR15m (ngan han, sat gia): cfg.sl_atr_mult (mac dinh 1.2).
+      - Ca 3 TP tinh theo ATR4h (dai han, "an xa"), KHONG phai ATR15m:
+        cfg.tp1_atr4h_mult / cfg.tp2_atr4h_mult / cfg.tp3_atr4h_mult
+        (mac dinh 1.0 / 2.5 / 5.0).
+    Dung getattr(..., default) chi de phong truong hop cfg thieu field (vi du
+    ban .env cu chua co) - khong doi gia tri mac dinh so voi config.py.
+    """
+    sl_mult = getattr(cfg, "sl_atr_mult", 1.2)
+    tp1_mult = getattr(cfg, "tp1_atr4h_mult", 1.0)
+    tp2_mult = getattr(cfg, "tp2_atr4h_mult", 2.5)
+    tp3_mult = getattr(cfg, "tp3_atr4h_mult", 5.0)
+
+    if direction == "long":
+        sl = entry - sl_mult * atr15m
+        tp1 = entry + tp1_mult * atr4h
+        tp2 = entry + tp2_mult * atr4h
+        tp3 = entry + tp3_mult * atr4h
+    elif direction == "short":
+        sl = entry + sl_mult * atr15m
+        tp1 = entry - tp1_mult * atr4h
+        tp2 = entry - tp2_mult * atr4h
+        tp3 = entry - tp3_mult * atr4h
+    else:
+        sl = tp1 = tp2 = tp3 = entry
+
+    return {"sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3}
+
+
 def rank_top(results: List[dict], top_n: int = 5) -> List[dict]:
     scored = [r for r in results if r.get("direction") != "neutral" and not r.get("veto")]
     return sorted(scored, key=lambda r: r["score"], reverse=True)[:top_n]
