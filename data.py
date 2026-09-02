@@ -1,0 +1,931 @@
+"""
+data.py
+Universe management, REST/WS data cho Binance USDT-M Futures (lead venue) +
+gia tham chieu cross-exchange, tape, book, volume profile, liquidation,
+iceberg/spoof/absorption proxy, positioning, regime.
+
+Khong dat lenh. Chi doc du lieu public.
+"""
+from __future__ import annotations
+
+import json
+import statistics
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Deque, Dict, List, Optional, Tuple
+
+import requests
+
+try:
+    import websocket  # websocket-client
+except ImportError:  # pragma: no cover
+    websocket = None
+
+from .config import AppConfig, get_logger
+
+log = get_logger("data")
+
+FAPI = "https://fapi.binance.com"
+WS_PUBLIC = "wss://fstream.binance.com/public/stream?streams="
+WS_MARKET = "wss://fstream.binance.com/market/stream?streams="
+
+CROSS_EXCHANGE_ENDPOINTS = {
+    # best-effort public ticker endpoints, symbol format handled per-exchange
+    "OKX": "https://www.okx.com/api/v5/market/ticker?instId={inst}",
+    "BYBIT": "https://api.bybit.com/v5/market/tickers?category=linear&symbol={sym}",
+    "BINGX": "https://open-api.bingx.com/openApi/swap/v2/quote/price?symbol={inst}",
+    "KUCOIN": "https://api-futures.kucoin.com/api/v1/ticker?symbol={inst}",
+    "BITGET": "https://api.bitget.com/api/v2/mix/market/ticker?symbol={sym}&productType=USDT-FUTURES",
+    "MEXC": "https://contract.mexc.com/api/v1/contract/ticker?symbol={inst}",
+}
+
+
+def _session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({"User-Agent": "bot_mm_fund/1.0"})
+    return s
+
+
+SESSION = _session()
+
+
+def safe_get(url: str, params: dict = None, timeout: float = 5.0) -> Optional[dict]:
+    try:
+        r = SESSION.get(url, params=params, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:  # noqa: BLE001
+        log.warning("GET fail %s : %s", url, e)
+        return None
+
+
+# --------------------------------------------------------------------------
+# Pure compute helpers (khong I/O -> de test)
+# --------------------------------------------------------------------------
+
+def compute_cvd(trades: List[dict]) -> float:
+    """Cumulative volume delta. trade = {'qty': float, 'isBuyerMaker': bool}.
+    isBuyerMaker=True nghia la taker la nguoi ban (sell aggressor) -> tru.
+    isBuyerMaker=False nghia la taker mua (buy aggressor) -> cong.
+    """
+    cvd = 0.0
+    for t in trades:
+        qty = float(t.get("qty", 0.0))
+        if t.get("isBuyerMaker"):
+            cvd -= qty
+        else:
+            cvd += qty
+    return cvd
+
+
+def compute_imbalance(bids: List[Tuple[float, float]], asks: List[Tuple[float, float]],
+                       levels: int = 20) -> float:
+    """(bidVol - askVol) / (bidVol + askVol) tren N muc dau."""
+    bid_vol = sum(q for _, q in bids[:levels])
+    ask_vol = sum(q for _, q in asks[:levels])
+    total = bid_vol + ask_vol
+    if total <= 0:
+        return 0.0
+    return (bid_vol - ask_vol) / total
+
+
+def compute_microprice(best_bid: float, best_bid_qty: float,
+                        best_ask: float, best_ask_qty: float) -> float:
+    total = best_bid_qty + best_ask_qty
+    if total <= 0:
+        return (best_bid + best_ask) / 2 if (best_bid and best_ask) else 0.0
+    return (best_bid * best_ask_qty + best_ask * best_bid_qty) / total
+
+
+def compute_atr(klines: List[dict], period: int = 14) -> float:
+    """klines: list dict co high, low, close (thu tu cu -> moi). Wilder-ish simple avg TR."""
+    if len(klines) < 2:
+        return 0.0
+    trs = []
+    prev_close = klines[0]["close"]
+    for k in klines[1:]:
+        high, low, close = k["high"], k["low"], k["close"]
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(tr)
+        prev_close = close
+    if not trs:
+        return 0.0
+    window = trs[-period:] if len(trs) >= period else trs
+    return sum(window) / len(window)
+
+
+def bias_from_klines(klines: List[dict], n: int) -> str:
+    """So close hien tai voi close N nen truoc. long/short/neutral."""
+    if len(klines) < n + 1:
+        return "neutral"
+    now_close = klines[-1]["close"]
+    past_close = klines[-1 - n]["close"]
+    if past_close == 0:
+        return "neutral"
+    change = (now_close - past_close) / past_close
+    if change > 0.0005:
+        return "long"
+    if change < -0.0005:
+        return "short"
+    return "neutral"
+
+
+def compute_volume_profile(trades: List[dict], atr15m: float, buckets: int = 40,
+                            fallback_klines: Optional[List[dict]] = None) -> dict:
+    """
+    Bucket width = atr15m / 40 (theo spec 'bucket ATR15m/40').
+    Neu tape khong du (trades rong), dung fallback_klines (15m/1h) de xay
+    volume-by-price xap xi tu close cua tung nen.
+    Tra ve poc, hvn (list), lvn (list), delta_at_poc, distance_to_poc.
+    """
+    bucket_width = atr15m / 40.0 if atr15m > 0 else 0.0
+    vol_by_bucket: Dict[int, float] = {}
+    buy_by_bucket: Dict[int, float] = {}
+    sell_by_bucket: Dict[int, float] = {}
+    last_price = None
+
+    def _bucket_of(price: float) -> int:
+        if bucket_width <= 0:
+            return 0
+        return int(round(price / bucket_width))
+
+    if trades:
+        for t in trades:
+            price = float(t.get("price", 0.0))
+            qty = float(t.get("qty", 0.0))
+            last_price = price
+            b = _bucket_of(price)
+            vol_by_bucket[b] = vol_by_bucket.get(b, 0.0) + qty
+            if t.get("isBuyerMaker"):
+                sell_by_bucket[b] = sell_by_bucket.get(b, 0.0) + qty
+            else:
+                buy_by_bucket[b] = buy_by_bucket.get(b, 0.0) + qty
+    elif fallback_klines:
+        for k in fallback_klines:
+            price = k["close"]
+            qty = k.get("volume", 0.0)
+            last_price = price
+            b = _bucket_of(price)
+            vol_by_bucket[b] = vol_by_bucket.get(b, 0.0) + qty
+            buy_vol = k.get("taker_buy_base", qty / 2.0)
+            buy_by_bucket[b] = buy_by_bucket.get(b, 0.0) + buy_vol
+            sell_by_bucket[b] = sell_by_bucket.get(b, 0.0) + max(qty - buy_vol, 0.0)
+
+    if not vol_by_bucket:
+        return {
+            "poc": last_price or 0.0, "hvn": [], "lvn": [],
+            "delta_at_poc": 0.0, "distance_to_poc": 0.0,
+        }
+
+    poc_bucket = max(vol_by_bucket, key=vol_by_bucket.get)
+    poc_vol = vol_by_bucket[poc_bucket]
+    poc_price = poc_bucket * bucket_width if bucket_width > 0 else (last_price or 0.0)
+
+    hvn = [b * bucket_width for b, v in vol_by_bucket.items() if v >= 0.7 * poc_vol]
+    lvn = [b * bucket_width for b, v in vol_by_bucket.items() if v <= 0.1 * poc_vol]
+
+    delta_at_poc = buy_by_bucket.get(poc_bucket, 0.0) - sell_by_bucket.get(poc_bucket, 0.0)
+    distance_to_poc = 0.0
+    if last_price and poc_price:
+        distance_to_poc = (last_price - poc_price) / poc_price
+
+    return {
+        "poc": poc_price, "hvn": sorted(hvn), "lvn": sorted(lvn),
+        "delta_at_poc": delta_at_poc, "distance_to_poc": distance_to_poc,
+    }
+
+
+def detect_sweep(klines_15m: List[dict], klines_1h: List[dict]) -> dict:
+    """Sweep = pha vo high/low 20 nen 15m HOAC 12 nen 1h roi (proxy) dong lai gan."""
+    result = {"swept": False, "side": None, "tf": None}
+    if len(klines_15m) >= 21:
+        window = klines_15m[-21:-1]
+        last = klines_15m[-1]
+        hi = max(k["high"] for k in window)
+        lo = min(k["low"] for k in window)
+        if last["high"] > hi:
+            result = {"swept": True, "side": "short", "tf": "15m"}  # sweep high -> fade short
+        elif last["low"] < lo:
+            result = {"swept": True, "side": "long", "tf": "15m"}
+    if not result["swept"] and len(klines_1h) >= 13:
+        window = klines_1h[-13:-1]
+        last = klines_1h[-1]
+        hi = max(k["high"] for k in window)
+        lo = min(k["low"] for k in window)
+        if last["high"] > hi:
+            result = {"swept": True, "side": "short", "tf": "1h"}
+        elif last["low"] < lo:
+            result = {"swept": True, "side": "long", "tf": "1h"}
+    return result
+
+
+def classify_regime(klines_1h: List[dict]) -> str:
+    """accumulation / trending / high_volatility tu khung 1h."""
+    if len(klines_1h) < 15:
+        return "accumulation"
+    atr = compute_atr(klines_1h, period=14)
+    closes = [k["close"] for k in klines_1h[-15:]]
+    avg_price = sum(closes) / len(closes)
+    if avg_price <= 0:
+        return "accumulation"
+    atr_pct = atr / avg_price
+    directional = abs(closes[-1] - closes[0]) / avg_price
+    if atr_pct > 0.02:
+        return "high_volatility"
+    if directional > 0.015:
+        return "trending"
+    return "accumulation"
+
+
+# --------------------------------------------------------------------------
+# REST: Universe + klines + positioning (Binance USDT-M futures = lead venue)
+# --------------------------------------------------------------------------
+
+class UniverseManager:
+    """Quan ly vu tru USDT-M PERPETUAL TRADING tren Binance Futures + /coinstrong."""
+
+    def __init__(self, cfg: AppConfig):
+        self.cfg = cfg
+        self.coinstrong = cfg.coinstrong_default
+        self._lock = threading.Lock()
+        self._last_refresh = 0.0
+        self.symbols_info: Dict[str, dict] = {}
+        self.tickers: Dict[str, dict] = {}
+        self.scan_set: List[str] = list(cfg.core_symbols)
+
+    def set_coinstrong(self, on: bool) -> None:
+        with self._lock:
+            self.coinstrong = on
+
+    def fetch_exchange_info(self) -> Dict[str, dict]:
+        data = safe_get(f"{FAPI}/fapi/v1/exchangeInfo")
+        out = {}
+        if not data:
+            return out
+        for s in data.get("symbols", []):
+            if (s.get("status") == "TRADING" and s.get("contractType") == self.cfg.contract_type
+                    and s.get("quoteAsset") == self.cfg.quote_asset):
+                out[s["symbol"]] = s
+        return out
+
+    def fetch_24h_tickers(self) -> Dict[str, dict]:
+        data = safe_get(f"{FAPI}/fapi/v1/ticker/24hr")
+        out = {}
+        if not data:
+            return out
+        for t in data:
+            out[t["symbol"]] = t
+        return out
+
+    def refresh(self, force: bool = False) -> bool:
+        now = time.time()
+        if not force and (now - self._last_refresh) < self.cfg.universe_refresh_seconds:
+            return False
+        info = self.fetch_exchange_info()
+        tick = self.fetch_24h_tickers()
+        if not info or not tick:
+            log.warning("Universe refresh loi, giu du lieu cu")
+            return False
+        with self._lock:
+            self.symbols_info = info
+            self.tickers = tick
+            self.scan_set = self._build_scan_set()
+            self._last_refresh = now
+        return True
+
+    def _build_scan_set(self) -> List[str]:
+        valid = [s for s in self.symbols_info.keys() if s in self.tickers]
+
+        def qvol(sym: str) -> float:
+            try:
+                return float(self.tickers[sym].get("quoteVolume", 0.0))
+            except (TypeError, ValueError):
+                return 0.0
+
+        core = [s for s in self.cfg.core_symbols if s in valid]
+        rest = [s for s in valid if s not in core]
+
+        if not self.coinstrong:
+            rest_sorted = sorted(rest, key=qvol, reverse=True)
+            limit = max(self.cfg.scan_limit_off - len(core), 0)
+            return core + rest_sorted[:limit]
+
+        # coinstrong ON: them alt nong theo hot_score
+        def change_pct(sym: str) -> float:
+            try:
+                return float(self.tickers[sym].get("priceChangePercent", 0.0))
+            except (TypeError, ValueError):
+                return 0.0
+
+        def range_pct(sym: str) -> float:
+            t = self.tickers[sym]
+            try:
+                hi, lo, last = float(t["highPrice"]), float(t["lowPrice"]), float(t["lastPrice"])
+                return ((hi - lo) / last * 100.0) if last else 0.0
+            except (KeyError, ValueError, ZeroDivisionError):
+                return 0.0
+
+        hot_candidates = []
+        for s in rest:
+            chg = change_pct(s)
+            vol = qvol(s)
+            rng = range_pct(s)
+            if abs(chg) >= self.cfg.min_hot_change_pct and vol >= self.cfg.min_quote_volume:
+                hot_score = vol * (1 + abs(chg) / 10.0) * (1 + rng / 20.0)
+                hot_candidates.append((s, hot_score))
+        hot_candidates.sort(key=lambda x: x[1], reverse=True)
+
+        top_volume = sorted(rest, key=qvol, reverse=True)
+        limit = max(self.cfg.scan_limit_on - len(core), 0)
+        merged: List[str] = []
+        seen = set(core)
+        for s, _ in hot_candidates:
+            if s not in seen and len(merged) < limit:
+                merged.append(s)
+                seen.add(s)
+        for s in top_volume:
+            if s not in seen and len(merged) < limit:
+                merged.append(s)
+                seen.add(s)
+        return core + merged
+
+    def get_scan_set(self) -> List[str]:
+        with self._lock:
+            return list(self.scan_set)
+
+    def ws_symbols(self, max_extra: int = 15) -> List[str]:
+        """CORE + toi da max_extra cap dau scan set (khong trung CORE)."""
+        with self._lock:
+            core = list(self.cfg.core_symbols)
+            extra = [s for s in self.scan_set if s not in core][:max_extra]
+            return core + extra
+
+
+def fetch_klines(symbol: str, interval: str, limit: int = 60) -> List[dict]:
+    raw = safe_get(f"{FAPI}/fapi/v1/klines", params={
+        "symbol": symbol, "interval": interval, "limit": limit,
+    })
+    out = []
+    if not raw:
+        return out
+    for k in raw:
+        try:
+            volume = float(k[5])
+            taker_buy_base = float(k[9])
+            out.append({
+                "open_time": k[0], "open": float(k[1]), "high": float(k[2]),
+                "low": float(k[3]), "close": float(k[4]), "volume": volume,
+                "close_time": k[6], "taker_buy_base": taker_buy_base,
+            })
+        except (IndexError, ValueError, TypeError):
+            continue
+    return out
+
+
+def fetch_agg_trades(symbol: str, limit: int = 500) -> List[dict]:
+    raw = safe_get(f"{FAPI}/fapi/v1/aggTrades", params={"symbol": symbol, "limit": limit})
+    out = []
+    if not raw:
+        return out
+    for t in raw:
+        out.append({
+            "price": float(t["p"]), "qty": float(t["q"]),
+            "isBuyerMaker": bool(t["m"]), "ts": t["T"],
+        })
+    return out
+
+
+def fetch_depth(symbol: str, limit: int = 20) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
+    raw = safe_get(f"{FAPI}/fapi/v1/depth", params={"symbol": symbol, "limit": limit})
+    if not raw:
+        return [], []
+    bids = [(float(p), float(q)) for p, q in raw.get("bids", [])]
+    asks = [(float(p), float(q)) for p, q in raw.get("asks", [])]
+    return bids, asks
+
+
+def fetch_funding(symbol: str) -> Optional[float]:
+    raw = safe_get(f"{FAPI}/fapi/v1/premiumIndex", params={"symbol": symbol})
+    if not raw:
+        return None
+    try:
+        return float(raw.get("lastFundingRate", 0.0))
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_mark_index(symbol: str) -> Tuple[Optional[float], Optional[float]]:
+    raw = safe_get(f"{FAPI}/fapi/v1/premiumIndex", params={"symbol": symbol})
+    if not raw:
+        return None, None
+    try:
+        return float(raw.get("markPrice")), float(raw.get("indexPrice"))
+    except (TypeError, ValueError):
+        return None, None
+
+
+def fetch_open_interest(symbol: str) -> Optional[float]:
+    raw = safe_get(f"{FAPI}/fapi/v1/openInterest", params={"symbol": symbol})
+    if not raw:
+        return None
+    try:
+        return float(raw.get("openInterest"))
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_long_short_ratio(symbol: str) -> Optional[float]:
+    raw = safe_get(f"{FAPI}/futures/data/topLongShortPositionRatio", params={
+        "symbol": symbol, "period": "15m", "limit": 1,
+    })
+    if not raw:
+        return None
+    try:
+        return float(raw[0].get("longShortRatio"))
+    except (IndexError, KeyError, TypeError, ValueError):
+        return None
+
+
+def fetch_cross_exchange_price(exchange: str, symbol: str) -> Optional[float]:
+    """Best-effort, tra ve None neu loi (khong lam sap vong quet)."""
+    base = symbol.replace("USDT", "")
+    try:
+        if exchange == "OKX":
+            url = CROSS_EXCHANGE_ENDPOINTS["OKX"].format(inst=f"{base}-USDT-SWAP")
+            r = safe_get(url)
+            return float(r["data"][0]["last"]) if r and r.get("data") else None
+        if exchange == "BYBIT":
+            url = CROSS_EXCHANGE_ENDPOINTS["BYBIT"].format(sym=symbol)
+            r = safe_get(url)
+            lst = r["result"]["list"] if r and r.get("result") else []
+            return float(lst[0]["lastPrice"]) if lst else None
+        if exchange == "BINGX":
+            url = CROSS_EXCHANGE_ENDPOINTS["BINGX"].format(inst=f"{base}-USDT")
+            r = safe_get(url)
+            return float(r["data"]["price"]) if r and r.get("data") else None
+        if exchange == "KUCOIN":
+            url = CROSS_EXCHANGE_ENDPOINTS["KUCOIN"].format(inst=f"{base}USDTM")
+            r = safe_get(url)
+            return float(r["data"]["price"]) if r and r.get("data") else None
+        if exchange == "BITGET":
+            url = CROSS_EXCHANGE_ENDPOINTS["BITGET"].format(sym=symbol)
+            r = safe_get(url)
+            data = r.get("data") if r else None
+            if data and isinstance(data, list):
+                return float(data[0]["lastPr"])
+            return None
+        if exchange == "MEXC":
+            url = CROSS_EXCHANGE_ENDPOINTS["MEXC"].format(inst=f"{base}_USDT")
+            r = safe_get(url)
+            return float(r["data"]["lastPrice"]) if r and r.get("data") else None
+    except Exception as e:  # noqa: BLE001
+        log.debug("cross-exchange %s %s loi: %s", exchange, symbol, e)
+        return None
+    return None
+
+
+# --------------------------------------------------------------------------
+# Realtime state: TradeTape / LocalBook / LiquidationTape
+# --------------------------------------------------------------------------
+
+class TradeTape:
+    """Luu trade gan nhat cho 1 symbol, tinh CVD 1m/5m/15m + large print cluster."""
+
+    def __init__(self, cfg: AppConfig):
+        self.cfg = cfg
+        self.trades: Deque[dict] = deque()
+        self._lock = threading.Lock()
+
+    def add_trade(self, price: float, qty: float, is_buyer_maker: bool, ts: int) -> None:
+        with self._lock:
+            self.trades.append({"price": price, "qty": qty, "isBuyerMaker": is_buyer_maker, "ts": ts})
+            cutoff = ts - self.cfg.tape_window_seconds * 1000
+            while self.trades and self.trades[0]["ts"] < cutoff:
+                self.trades.popleft()
+
+    def seed(self, trades: List[dict]) -> None:
+        with self._lock:
+            for t in trades:
+                self.trades.append(t)
+
+    def snapshot(self) -> List[dict]:
+        with self._lock:
+            return list(self.trades)
+
+    def cvd_window(self, seconds: int) -> float:
+        now = self.trades[-1]["ts"] if self.trades else int(time.time() * 1000)
+        cutoff = now - seconds * 1000
+        with self._lock:
+            window = [t for t in self.trades if t["ts"] >= cutoff]
+        return compute_cvd(window)
+
+    def large_print_cluster(self) -> dict:
+        """Cum >=3 lenh lon cung phia trong 30s. Nguong = MIN_LARGE_PRINT_USD hoac quantile."""
+        with self._lock:
+            trades = list(self.trades)
+        if not trades:
+            return {"cluster": False, "side": None, "count": 0}
+        usd_vals = [t["price"] * t["qty"] for t in trades]
+        try:
+            q = statistics.quantiles(usd_vals, n=1000)[int(self.cfg.large_print_quantile * 1000) - 1]
+        except (statistics.StatisticsError, IndexError):
+            q = max(usd_vals) if usd_vals else 0.0
+        threshold = max(self.cfg.min_large_print_usd, min(q, self.cfg.min_large_print_usd * 20))
+        large = [t for t in trades if t["price"] * t["qty"] >= threshold]
+        if not large:
+            return {"cluster": False, "side": None, "count": 0}
+        last_ts = large[-1]["ts"]
+        window = [t for t in large if last_ts - t["ts"] <= 30_000]
+        buy_count = sum(1 for t in window if not t["isBuyerMaker"])
+        sell_count = sum(1 for t in window if t["isBuyerMaker"])
+        if buy_count >= 3 and buy_count >= sell_count:
+            return {"cluster": True, "side": "long", "count": buy_count}
+        if sell_count >= 3 and sell_count > buy_count:
+            return {"cluster": True, "side": "short", "count": sell_count}
+        return {"cluster": False, "side": None, "count": max(buy_count, sell_count)}
+
+
+class LocalBook:
+    """Sổ lệnh cục bộ cho 1 symbol tu WS depth20 hoac REST fallback."""
+
+    def __init__(self, cfg: AppConfig):
+        self.cfg = cfg
+        self.bids: List[Tuple[float, float]] = []
+        self.asks: List[Tuple[float, float]] = []
+        self._history: Deque[Tuple[float, List[Tuple[float, float]], List[Tuple[float, float]]]] = deque(maxlen=50)
+        self._lock = threading.Lock()
+        self.last_update = 0.0
+
+    def update(self, bids: List[Tuple[float, float]], asks: List[Tuple[float, float]]) -> None:
+        with self._lock:
+            now = time.time()
+            self.bids, self.asks = bids, asks
+            self._history.append((now, bids, asks))
+            self.last_update = now
+
+    def imbalance(self) -> float:
+        with self._lock:
+            return compute_imbalance(self.bids, self.asks, self.cfg.depth_levels)
+
+    def microprice(self) -> float:
+        with self._lock:
+            if not self.bids or not self.asks:
+                return 0.0
+            bb, bq = self.bids[0]
+            ba, aq = self.asks[0]
+            return compute_microprice(bb, bq, ba, aq)
+
+    def persist_score(self) -> float:
+        """0..1: top-of-book on dinh qua bao nhieu snapshot lien tiep (BOOK_PERSIST_MS)."""
+        with self._lock:
+            hist = list(self._history)
+        if len(hist) < 2:
+            return 0.0
+        stable = 0
+        total = 0
+        for i in range(1, len(hist)):
+            t0, b0, a0 = hist[i - 1]
+            t1, b1, a1 = hist[i]
+            if (t1 - t0) * 1000 > self.cfg.book_persist_ms * 3:
+                continue
+            total += 1
+            if b0 and b1 and a0 and a1:
+                same_bid = abs(b0[0][0] - b1[0][0]) < 1e-9
+                same_ask = abs(a0[0][0] - a1[0][0]) < 1e-9
+                if same_bid and same_ask:
+                    stable += 1
+        return stable / total if total else 0.0
+
+    def pull_ratio_3s(self) -> float:
+        """Ty le volume top-of-book bi rut trong 3s gan nhat (proxy spoof)."""
+        with self._lock:
+            hist = [h for h in self._history if time.time() - h[0] <= 3.0]
+        if len(hist) < 2:
+            return 0.0
+        first_vol = sum(q for _, q in hist[0][1][:5]) + sum(q for _, q in hist[0][2][:5])
+        last_vol = sum(q for _, q in hist[-1][1][:5]) + sum(q for _, q in hist[-1][2][:5])
+        if first_vol <= 0:
+            return 0.0
+        pulled = max(first_vol - last_vol, 0.0)
+        return min(pulled / first_vol, 1.0)
+
+
+class LiquidationTape:
+    """Tich luy thanh ly tu WS @forceOrder."""
+
+    def __init__(self, window_seconds: int = 3600):
+        self.window_seconds = window_seconds
+        self.events: Deque[dict] = deque()
+        self._lock = threading.Lock()
+
+    def add_event(self, side: str, usd: float, ts: int) -> None:
+        with self._lock:
+            self.events.append({"side": side, "usd": usd, "ts": ts})
+            cutoff = ts - self.window_seconds * 1000
+            while self.events and self.events[0]["ts"] < cutoff:
+                self.events.popleft()
+
+    def totals(self) -> dict:
+        with self._lock:
+            events = list(self.events)
+        long_liq = sum(e["usd"] for e in events if e["side"] == "long")
+        short_liq = sum(e["usd"] for e in events if e["side"] == "short")
+        now = events[-1]["ts"] if events else int(time.time() * 1000)
+        cutoff = now - 60_000
+        impulse_long = sum(e["usd"] for e in events if e["side"] == "long" and e["ts"] >= cutoff)
+        impulse_short = sum(e["usd"] for e in events if e["side"] == "short" and e["ts"] >= cutoff)
+        return {
+            "long_liq_usd": long_liq, "short_liq_usd": short_liq,
+            "impulse_60s_long": impulse_long, "impulse_60s_short": impulse_short,
+        }
+
+
+def detect_iceberg_spoof(book: LocalBook) -> float:
+    """Proxy spoof_score 0..1 = pull_ratio_3s cao ma khong co giao dich tuong ung."""
+    return book.pull_ratio_3s()
+
+
+def detect_absorption(cvd_short: float, side_price_move: float, persist_score: float) -> dict:
+    """
+    CVD nguoc voi huong gia (vd CVD am nhung gia khong giam) + book persist cao
+    => absorption. side_price_move: % thay doi gia gan nhat (duong = tang).
+    """
+    absorbed = False
+    side = None
+    if cvd_short < 0 and side_price_move >= 0 and persist_score >= 0.5:
+        absorbed, side = True, "long"  # ban bi hap thu -> nghieng long
+    elif cvd_short > 0 and side_price_move <= 0 and persist_score >= 0.5:
+        absorbed, side = True, "short"  # mua bi hap thu -> nghieng short
+    return {"absorption": absorbed, "side": side}
+
+
+# --------------------------------------------------------------------------
+# StreamHub: 2 WebSocket connections (public / market)
+# --------------------------------------------------------------------------
+
+class StreamHub:
+    """Mo 2 ket noi WS (public: bookTicker+depth20, market: aggTrade+forceOrder+markPrice).
+    Reconnect voi backoff. Khong chan REST khi WS chet."""
+
+    def __init__(self, cfg: AppConfig, tapes: Dict[str, TradeTape], books: Dict[str, LocalBook],
+                 liq: LiquidationTape):
+        self.cfg = cfg
+        self.tapes = tapes
+        self.books = books
+        self.liq = liq
+        self._stop = threading.Event()
+        self._threads: List[threading.Thread] = []
+        self.mark_price: Dict[str, float] = {}
+
+    def start(self, symbols: List[str]) -> None:
+        if websocket is None:
+            log.warning("websocket-client chua duoc cai, bo qua WS, dung REST fallback")
+            return
+        public_streams = []
+        market_streams = []
+        for s in symbols:
+            sym = s.lower()
+            public_streams += [f"{sym}@bookTicker", f"{sym}@depth20@100ms"]
+            market_streams += [f"{sym}@aggTrade", f"{sym}@forceOrder", f"{sym}@markPrice@1s"]
+        t1 = threading.Thread(target=self._run, args=(WS_PUBLIC + "/".join(public_streams), self._on_public),
+                               daemon=True)
+        t2 = threading.Thread(target=self._run, args=(WS_MARKET + "/".join(market_streams), self._on_market),
+                               daemon=True)
+        t1.start()
+        t2.start()
+        self._threads = [t1, t2]
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _run(self, url: str, handler) -> None:
+        backoff = 1
+        while not self._stop.is_set():
+            try:
+                ws = websocket.WebSocketApp(
+                    url,
+                    on_message=lambda _ws, msg: handler(msg),
+                    on_error=lambda _ws, err: log.warning("WS error: %s", err),
+                )
+                ws.run_forever(ping_interval=20, ping_timeout=10)
+            except Exception as e:  # noqa: BLE001
+                log.warning("WS run_forever loi: %s", e)
+            if self._stop.is_set():
+                break
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+
+    def _on_public(self, msg: str) -> None:
+        try:
+            payload = json.loads(msg)
+            data = payload.get("data", payload)
+            stream = payload.get("stream", "")
+            if "@bookTicker" in stream:
+                sym = data.get("s")
+                book = self.books.get(sym)
+                if book and data.get("b") and data.get("a"):
+                    bb, bq = float(data["b"]), float(data["B"])
+                    ba, aq = float(data["a"]), float(data["A"])
+                    if not book.bids or not book.asks:
+                        book.update([(bb, bq)], [(ba, aq)])
+                    else:
+                        with book._lock:  # cap nhat top-of-book nhanh
+                            bids = [(bb, bq)] + book.bids[1:]
+                            asks = [(ba, aq)] + book.asks[1:]
+                        book.update(bids, asks)
+            elif "@depth20" in stream:
+                sym = data.get("s") or stream.split("@")[0].upper()
+                book = self.books.get(sym)
+                if book:
+                    bids = [(float(p), float(q)) for p, q in data.get("b", [])]
+                    asks = [(float(p), float(q)) for p, q in data.get("a", [])]
+                    if bids and asks:
+                        book.update(bids, asks)
+        except Exception as e:  # noqa: BLE001
+            log.debug("on_public parse loi: %s", e)
+
+    def _on_market(self, msg: str) -> None:
+        try:
+            payload = json.loads(msg)
+            data = payload.get("data", payload)
+            stream = payload.get("stream", "")
+            if "@aggTrade" in stream:
+                sym = data.get("s")
+                tape = self.tapes.get(sym)
+                if tape:
+                    tape.add_trade(float(data["p"]), float(data["q"]), bool(data["m"]), int(data["T"]))
+            elif "@forceOrder" in stream:
+                o = data.get("o", {})
+                sym = o.get("s")
+                side = "long" if o.get("S") == "SELL" else "short"
+                # forceOrder SELL = thanh ly vi the LONG; BUY = thanh ly vi the SHORT
+                usd = float(o.get("ap", 0.0) or o.get("p", 0.0)) * float(o.get("q", 0.0))
+                if sym:
+                    self.liq.add_event(side, usd, int(data.get("E", time.time() * 1000)))
+            elif "@markPrice" in stream:
+                sym = data.get("s")
+                if sym and data.get("p"):
+                    self.mark_price[sym] = float(data["p"])
+        except Exception as e:  # noqa: BLE001
+            log.debug("on_market parse loi: %s", e)
+
+
+# --------------------------------------------------------------------------
+# MarketContext: gom toan bo state realtime + cache REST cho 1 lan build_features
+# --------------------------------------------------------------------------
+
+class MarketContext:
+    """Container cho toan bo state (tapes, books, liq, funding history) dung xuyen suot engine."""
+
+    def __init__(self, cfg: AppConfig):
+        self.cfg = cfg
+        self.tapes: Dict[str, TradeTape] = {}
+        self.books: Dict[str, LocalBook] = {}
+        self.liq = LiquidationTape()
+        self.funding_history: Dict[str, Deque[float]] = {}
+        self.stream: Optional[StreamHub] = None
+
+    def ensure_symbol(self, symbol: str) -> None:
+        if symbol not in self.tapes:
+            self.tapes[symbol] = TradeTape(self.cfg)
+        if symbol not in self.books:
+            self.books[symbol] = LocalBook(self.cfg)
+        if symbol not in self.funding_history:
+            self.funding_history[symbol] = deque(maxlen=200)
+
+    def start_stream(self, ws_symbols: List[str]) -> None:
+        for s in ws_symbols:
+            self.ensure_symbol(s)
+        self.stream = StreamHub(self.cfg, self.tapes, self.books, self.liq)
+        self.stream.start(ws_symbols)
+
+    def funding_zscore(self, symbol: str, current: float) -> float:
+        hist = self.funding_history.setdefault(symbol, deque(maxlen=200))
+        hist.append(current)
+        if len(hist) < 5:
+            return 0.0
+        mean = statistics.mean(hist)
+        try:
+            stdev = statistics.stdev(hist)
+        except statistics.StatisticsError:
+            stdev = 0.0
+        if stdev == 0:
+            return 0.0
+        return (current - mean) / stdev
+
+
+def build_features(symbol: str, cfg: AppConfig, ctx: MarketContext, is_core: bool,
+                    is_ws_tracked: bool) -> dict:
+    """
+    Gom toan bo du lieu can thiet cho 1 symbol thanh 1 dict 'features' dung chung
+    cho ca signals.compute_composite() va ghi log features.jsonl.
+    CORE: full data + cross-exchange. Khong CORE nhung trong WS set: tape/book live,
+    khong cross-exchange. Con lai (REST-only, van lay HTF kline): light snapshot.
+    """
+    ctx.ensure_symbol(symbol)
+    now_ms = int(time.time() * 1000)
+
+    klines_15m = fetch_klines(symbol, "15m", limit=40)
+    klines_1h = fetch_klines(symbol, "1h", limit=30)
+    klines_4h = fetch_klines(symbol, "4h", limit=20)
+
+    bias_15m = bias_from_klines(klines_15m, 20)
+    bias_1h = bias_from_klines(klines_1h, 12)
+    bias_4h = bias_from_klines(klines_4h, 12)
+
+    atr15m = compute_atr(klines_15m, period=14)
+    last_price = klines_15m[-1]["close"] if klines_15m else 0.0
+
+    sweep = detect_sweep(klines_15m, klines_1h)
+    regime = classify_regime(klines_1h)
+
+    tape = ctx.tapes[symbol]
+    book = ctx.books[symbol]
+
+    if is_ws_tracked:
+        trades = tape.snapshot()
+        if not trades:
+            seeded = fetch_agg_trades(symbol, limit=500)
+            tape.seed(seeded)
+            trades = tape.snapshot()
+        cvd_1m = tape.cvd_window(60)
+        cvd_5m = tape.cvd_window(300)
+        cvd_15m = tape.cvd_window(900)
+        cluster = tape.large_print_cluster()
+        if not book.bids or not book.asks:
+            bids, asks = fetch_depth(symbol, cfg.depth_levels)
+            book.update(bids, asks)
+        imbalance = book.imbalance()
+        microprice = book.microprice()
+        persist = book.persist_score()
+        pull_ratio = book.pull_ratio_3s()
+    else:
+        trades = fetch_agg_trades(symbol, limit=200)
+        cvd_1m = compute_cvd([t for t in trades if now_ms - t.get("ts", now_ms) <= 60_000])
+        cvd_5m = compute_cvd([t for t in trades if now_ms - t.get("ts", now_ms) <= 300_000])
+        cvd_15m = compute_cvd(trades)
+        cluster = {"cluster": False, "side": None, "count": 0}
+        bids, asks = fetch_depth(symbol, cfg.depth_levels)
+        imbalance = compute_imbalance(bids, asks, cfg.depth_levels)
+        microprice = compute_microprice(bids[0][0], bids[0][1], asks[0][0], asks[0][1]) if bids and asks else 0.0
+        persist = 0.0
+        pull_ratio = 0.0
+
+    vp = compute_volume_profile(trades, atr15m, cfg.profile_tick_buckets, fallback_klines=klines_15m)
+
+    price_move_pct = 0.0
+    if len(klines_15m) >= 2 and klines_15m[-2]["close"]:
+        price_move_pct = (klines_15m[-1]["close"] - klines_15m[-2]["close"]) / klines_15m[-2]["close"]
+    absorption = detect_absorption(cvd_5m, price_move_pct, persist)
+    spoof_score = pull_ratio if is_ws_tracked else 0.0
+
+    liq_totals = ctx.liq.totals() if is_core else {
+        "long_liq_usd": 0.0, "short_liq_usd": 0.0, "impulse_60s_long": 0.0, "impulse_60s_short": 0.0}
+
+    funding = fetch_funding(symbol) if is_core or is_ws_tracked else None
+    mark_price, index_price = fetch_mark_index(symbol) if is_core else (None, None)
+    open_interest = fetch_open_interest(symbol) if is_core else None
+    lsr = fetch_long_short_ratio(symbol) if is_core else None
+    funding_z = ctx.funding_zscore(symbol, funding) if funding is not None else 0.0
+
+    basis = 0.0
+    if mark_price and index_price:
+        basis = (mark_price - index_price) / index_price
+
+    taker_ratio = 0.0
+    if klines_15m and klines_15m[-1]["volume"]:
+        taker_ratio = klines_15m[-1]["taker_buy_base"] / klines_15m[-1]["volume"]
+
+    cross_divergence = 0.0
+    if is_core:
+        prices = []
+        for ex in cfg.exchanges:
+            if ex == "BINANCE":
+                continue
+            p = fetch_cross_exchange_price(ex, symbol)
+            if p:
+                prices.append(p)
+        if prices and last_price:
+            avg_other = sum(prices) / len(prices)
+            cross_divergence = (last_price - avg_other) / avg_other
+
+    return {
+        "symbol": symbol, "ts": now_ms, "is_core": is_core, "is_ws_tracked": is_ws_tracked,
+        "last_price": last_price, "atr15m": atr15m,
+        "bias_15m": bias_15m, "bias_1h": bias_1h, "bias_4h": bias_4h,
+        "regime": regime, "sweep": sweep,
+        "volume_profile": vp,
+        "cvd_1m": cvd_1m, "cvd_5m": cvd_5m, "cvd_15m": cvd_15m,
+        "large_print_cluster": cluster,
+        "book_imbalance": imbalance, "microprice": microprice,
+        "persist_score": persist, "pull_ratio_3s": pull_ratio, "spoof_score": spoof_score,
+        "absorption": absorption,
+        "liquidation": liq_totals,
+        "funding_rate": funding, "funding_zscore": funding_z,
+        "basis": basis, "open_interest": open_interest,
+        "long_short_ratio": lsr, "taker_buy_sell_ratio": taker_ratio,
+        "cross_exchange_divergence": cross_divergence,
+        "price_move_pct_15m": price_move_pct,
+    }

@@ -1,0 +1,14 @@
+{
+  "volume_profile": 1.1,
+  "tape_flow": 1.1,
+  "absorption": 1.0,
+  "liquidation_impulse": 1.0,
+  "funding_extreme": 0.9,
+  "persistent_book": 0.8,
+  "liquidity_sweep": 0.8,
+  "basis_spread": 0.7,
+  "taker_buy_sell_ratio": 0.6,
+  "long_short_ratio": 0.6,
+  "order_book_imbalance": 0.5,
+  "cross_exchange_divergence": 0.5
+}
