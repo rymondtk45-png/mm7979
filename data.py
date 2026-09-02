@@ -9,6 +9,7 @@ Khong dat lenh. Chi doc du lieu public.
 from __future__ import annotations
 
 import json
+import math
 import statistics
 import threading
 import time
@@ -435,7 +436,13 @@ class UniverseManager:
             vol = qvol(s)
             rng = range_pct(s)
             if abs(chg) >= self.cfg.min_hot_change_pct and vol >= self.cfg.min_quote_volume:
-                hot_score = vol * (1 + abs(chg) / 10.0) * (1 + rng / 20.0)
+                # hot_score: uu tien %change/range (do "nong" thuc su), volume
+                # chi dung o thang LOG lam vai tro loc thanh khoan du dung (da
+                # loc cung boi min_quote_volume o dieu kien tren) - KHONG de
+                # volume tuyet doi (chenh lech hang tram/nghin lan giua cac
+                # coin) lan at het tin hieu %change/range nhu cong thuc cu
+                # (hot_score = vol * he_so_nho) tung lam.
+                hot_score = abs(chg) * (1 + rng / 100.0) * math.log10(max(vol, 10.0))
                 hot_candidates.append((s, hot_score))
         hot_candidates.sort(key=lambda x: x[1], reverse=True)
 
