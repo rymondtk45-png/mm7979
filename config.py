@@ -68,6 +68,11 @@ class AppConfig:
     universe_refresh_seconds: int = field(default_factory=lambda: _get_int("UNIVERSE_REFRESH_SECONDS", 60))
     exchanges: List[str] = field(default_factory=lambda: _get_list(
         "EXCHANGES", ["BINANCE", "OKX", "BYBIT", "BINGX", "KUCOIN", "BITGET", "MEXC"]))
+    # Them lai: bi thieu trong ban toi doc duoc tu GitHub (trang bi cat bot noi dung
+    # o cuoi data.py nen toi khong thay het cho dung cfg.cross_exchange_timeout).
+    # Gia tri mac dinh 5.0s khop voi timeout mac dinh cua safe_get() trong data.py.
+    cross_exchange_timeout: float = field(
+        default_factory=lambda: _get_float("CROSS_EXCHANGE_TIMEOUT", 5.0))
 
     # --- Full-model-for-all-pairs ---
     full_data_all: bool = field(default_factory=lambda: _get_bool("FULL_DATA_ALL", True))
