@@ -148,6 +148,15 @@ def format_alert(f: dict, result: dict, entry_info: dict, sl: float, tp: float) 
     )
 
 
+def _pnl_pct(direction: str, entry_price: float, price: float) -> float:
+    """% lai/lo tuong doi so voi gia entry (chua tru phi/funding)."""
+    if entry_price == 0:
+        return 0.0
+    if direction == "long":
+        return (price - entry_price) / entry_price * 100.0
+    return (entry_price - price) / entry_price * 100.0
+
+
 class SignalEngine:
     def __init__(self, cfg: AppConfig):
         self.cfg = cfg
@@ -202,8 +211,12 @@ class SignalEngine:
                     })
                 elif now - sig["created_at"] > self.cfg.signal_ttl_seconds:
                     # Limit cho qua lau khong khop -> huy, khong tinh la mot lenh da vao.
+                    self.bot.send_message(
+                        f"<b>{sym}</b> {direction.upper()} LIMIT het han, chua khop "
+                        f"(entry {sig['entry_price']:.6g}, gia hien tai {price:.6g}) -> huy kèo")
                     append_jsonl(self.cfg.resolve_path(self.cfg.log_path), {
                         "ts": now, "symbol": sym, "event": "limit_expired_unfilled",
+                        "entry": sig["entry_price"], "price": price,
                     })
                     expired.append(sym)
                 if not sig["filled"]:
@@ -221,13 +234,28 @@ class SignalEngine:
                 elif price <= sig["tp"]:
                     hit = "TP"
             if hit:
+                pnl_pct = _pnl_pct(direction, sig["entry_price"], price)
                 self.bot.send_message(
-                    f"<b>{sym}</b> {direction.upper()} da cham <b>{hit}</b> tai {price:.6g}")
+                    f"<b>{sym}</b> {direction.upper()} da cham <b>{hit}</b> tai {price:.6g} "
+                    f"(entry {sig['entry_price']:.6g}) | PnL: {pnl_pct:+.2f}%")
                 append_jsonl(self.cfg.resolve_path(self.cfg.log_path), {
                     "ts": now, "symbol": sym, "event": f"hit_{hit}", "price": price,
+                    "entry": sig["entry_price"], "pnl_pct": pnl_pct,
                 })
                 expired.append(sym)
             elif now - sig["created_at"] > self.cfg.signal_ttl_seconds:
+                # Da khop nhung het TTL ma khong cham SL lan TP -> dong ke o
+                # trang thai "het han", bao Telegram kem PnL uoc tinh (mark-to-market)
+                # de khong mat dau vet kèo nay.
+                pnl_pct = _pnl_pct(direction, sig["entry_price"], price)
+                self.bot.send_message(
+                    f"<b>{sym}</b> {direction.upper()} het han (khong cham SL/TP), "
+                    f"dong theo dõi tai {price:.6g} (entry {sig['entry_price']:.6g}) | "
+                    f"PnL uoc tinh: {pnl_pct:+.2f}%")
+                append_jsonl(self.cfg.resolve_path(self.cfg.log_path), {
+                    "ts": now, "symbol": sym, "event": "signal_expired", "price": price,
+                    "entry": sig["entry_price"], "pnl_pct": pnl_pct,
+                })
                 expired.append(sym)
         for sym in expired:
             self.active_signals.pop(sym, None)
