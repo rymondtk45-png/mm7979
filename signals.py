@@ -301,11 +301,15 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
         elif raw < -0.05:
             votes_short += 1
 
-    if abs(votes_long - votes_short) <= 1 and (votes_long + votes_short) > 0:
-        reasons.append("veto: mixed (vote long/short chenh <=1)")
+    active_opinions = votes_long + votes_short
+    vote_spread = abs(votes_long - votes_short)
+    if active_opinions < 4 or vote_spread < 3:
+        reasons.append(
+            f"veto: weak consensus ({active_opinions} module co y kien, chenh lech {vote_spread})"
+        )
         return {
             "score": 0.0, "direction": "neutral", "confidence": 0.0,
-            "reasons": reasons, "veto": True, "veto_reason": "mixed votes",
+            "reasons": reasons, "veto": True, "veto_reason": "weak consensus",
             "module_scores": module_scores,
         }
 
@@ -380,11 +384,11 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
 
 
 def suggested_sl_tp(entry: float, direction: str, atr15m: float) -> Tuple[float, float]:
-    """SL/TP tu ATR15m: SL = 0.8*ATR, TP = 1.5*ATR."""
+    """SL/TP tu ATR15m: SL = 1.2*ATR, TP = 2.4*ATR (R:R = 2.0)."""
     if direction == "long":
-        return entry - 0.8 * atr15m, entry + 1.5 * atr15m
+        return entry - 1.2 * atr15m, entry + 2.4 * atr15m
     if direction == "short":
-        return entry + 0.8 * atr15m, entry - 1.5 * atr15m
+        return entry + 1.2 * atr15m, entry - 2.4 * atr15m
     return entry, entry
 
 
