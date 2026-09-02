@@ -64,7 +64,7 @@ class AppConfig:
 
     coinstrong_default: bool = field(default_factory=lambda: _get_bool("COINSTRONG", False))
     scan_limit_off: int = field(default_factory=lambda: _get_int("SCAN_LIMIT_OFF", 25))
-    scan_limit_on: int = field(default_factory=lambda: _get_int("SCAN_LIMIT_ON", 80))
+    scan_limit_on: int = field(default_factory=lambda: _get_int("SCAN_LIMIT_ON", 200))
     min_quote_volume: float = field(default_factory=lambda: _get_float("MIN_QUOTE_VOLUME", 20_000_000))
     min_hot_change_pct: float = field(default_factory=lambda: _get_float("MIN_HOT_CHANGE_PCT", 3.0))
     universe_refresh_seconds: int = field(default_factory=lambda: _get_int("UNIVERSE_REFRESH_SECONDS", 60))

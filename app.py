@@ -220,8 +220,10 @@ class SignalEngine:
 
                 now = time.time()
                 on_cooldown = (now - self.cooldowns.get(symbol, 0)) < self.cfg.alert_cooldown_seconds
+                already_active = symbol in self.active_signals
                 if (not result["veto"] and result["direction"] != "neutral"
-                        and result["score"] >= self.cfg.threshold and not on_cooldown):
+                        and result["score"] >= self.cfg.threshold
+                        and not on_cooldown and not already_active):
                     entry = features["last_price"]
                     sl, tp = suggested_sl_tp(entry, result["direction"], features["atr15m"])
                     self.bot.send_message(format_alert(features, result))
