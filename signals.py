@@ -1,9 +1,12 @@
 """
 signals.py
+
 Module score + luat HTF veto + composite + ranking.
+
 Moi module tra ve signed float trong [-1, 1]: duong = nghieng long, am = nghieng short,
 do lon = do tin cay module do. Composite = sum(module_score * weight), sau do chuan hoa 0-100.
 """
+
 from __future__ import annotations
 
 from typing import Dict, List, Tuple
@@ -29,106 +32,21 @@ STRUCTURE_MODULES = {"volume_profile", "absorption", "persistent_book", "order_b
 MEANREV_MODULES = {"funding_extreme", "basis_spread", "long_short_ratio", "cross_exchange_divergence"}
 
 
-def _reference_price(f: dict) -> float:
-    """
-    Gia tham chieu 'fair' de tinh entry - KHONG chi dung last_price (1 tick don
-    le, de bi nhieu bien bam theo lenh cuoi cung), ma ket hop:
-    - microprice: trung binh best bid/ask theo trong so khoi luong (phan anh
-      ap luc mua/ban tuc thoi tot hon 1 tick trade don le).
-    - cross-exchange average: neu Binance dang lech dang ke so voi trung binh
-      lien san (|divergence| > 0.15%), keo reference ve giua 2 gia tri - tranh
-      entry dinh vao 1 spike rieng cua Binance (thuong se mean-revert nhanh).
-    Fallback last_price neu thieu du lieu (vd symbol khong duoc WS-track).
-    """
-    last = f.get("last_price", 0.0)
-    micro = f.get("microprice", 0.0)
-    ref = micro if micro > 0 else last
-    div = f.get("cross_exchange_divergence", 0.0)
-    if last and abs(div) > 0.0015:
-        avg_other = last / (1.0 + div)  # suy nguoc gia trung binh lien san tu divergence
-        ref = 0.5 * ref + 0.5 * avg_other
-    return ref if ref else last
-
-
-def _pick_structural_anchor(f: dict, direction: str, ref_price: float, atr: float) -> Tuple[float, str]:
-    """
-    Chon muc gia neo cho LIMIT entry, uu tien theo do tin cay cua tung loai
-    du lieu cau truc (khong chi POC nhu ban cu) - dung TOAN BO du lieu volume
-    profile + absorption + persist_score da co san trong features:
-
-    1. Absorption dang xay ra CUNG huong tai vung gia hien tai -> vung nay
-       dang duoc "giu" thuc su (co lenh lon hap thu) -> neo sat ref_price,
-       chi lui rat nhe (0.1x ATR) vi khong can cho gia lui xa.
-    2. HVN (high-volume node) gan nhat NAM DUNG PHIA can loi (duoi gia cho
-       long, tren gia cho short) trong 1.5x ATR -> day la vung thanh khoan day
-       ma nhieu lenh da khop truoc do, tin cay hon 1 diem POC don le.
-    3. POC (diem volume lon nhat) trong 1.2x ATR - fallback tu ban cu, van
-       giu vi la 1 dang HVN dac biet (manh nhat).
-    4. Khong co gi ro rang -> lui theo ATR thuan tuy (0.35x) nhu ban cu.
-
-    Tra ve (anchor_price, ly_do).
-    """
-    absorption = f.get("absorption", {})
-    if absorption.get("absorption") and absorption.get("side") == direction:
-        pullback = 0.1 * atr
-        anchor = ref_price - pullback if direction == "long" else ref_price + pullback
-        return anchor, "neo absorption (vung dang duoc hap thu, sat gia)"
-
-    vp = f.get("volume_profile", {})
-    hvn_list: List[float] = vp.get("hvn", []) or []
-    if hvn_list:
-        if direction == "long":
-            candidates = [p for p in hvn_list if p <= ref_price and (ref_price - p) <= 1.5 * atr]
-            if candidates:
-                return max(candidates), "neo HVN gan nhat (vung thanh khoan day)"
-        else:
-            candidates = [p for p in hvn_list if p >= ref_price and (p - ref_price) <= 1.5 * atr]
-            if candidates:
-                return min(candidates), "neo HVN gan nhat (vung thanh khoan day)"
-
-    poc = vp.get("poc", 0.0)
-    if direction == "long" and poc and poc <= ref_price and (ref_price - poc) <= 1.2 * atr:
-        return poc, "neo POC"
-    if direction == "short" and poc and poc >= ref_price and (poc - ref_price) <= 1.2 * atr:
-        return poc, "neo POC"
-
-    pullback = 0.35 * atr
-    anchor = ref_price - pullback if direction == "long" else ref_price + pullback
-    return anchor, "lui theo ATR (khong co vung cau truc ro rang)"
-
-
 def classify_entry(f: dict, result: dict, weights: Dict[str, float]) -> dict:
     """
-    Quyet dinh LIMIT hay MARKET + gia entry, dung TOAN BO du lieu da build
-    trong features (khong chi POC + last_price nhu ban cu):
+    Quyet dinh LIMIT hay MARKET dua tren TOAN BO dong gop cua cac module (khong
+    chi module manh nhat) - so sanh tong dong gop (raw*weight, cung chieu voi
+    huong tin hieu cuoi cung) cua nhom MOMENTUM vs nhom STRUCTURE+MEAN-REVERSION.
+    Regime va spoof_score dieu chinh nhe theo boi canh (high_volatility day ve
+    MARKET, accumulation/spoof nghi ngo day ve LIMIT).
 
-    1. Gia tham chieu dung microprice + cross-exchange fair value thay vi chi
-       last_price don le (xem _reference_price).
-    2. Huong dan dat (MARKET vs LIMIT) van dua tren tong dong gop cua TOAN BO
-       12 module, chia 2 nhom MOMENTUM (dang chay ngay) vs STRUCTURE+MEANREV
-       (dua tren vung gia/trang thai cham) - moi module trong weights.json
-       deu thuoc dung 1 trong 2 nhom, khong module nao bi bo qua.
-    3. Regime + spoof_score dieu chinh trong so 2 nhom nhu ban cu.
-    4. THEM: persist_score qua thap (<0.25) -> sach lenh khong du on dinh de
-       "nghi" 1 lenh LIMIT tai do (de bi hut mat truoc khi khop) -> ep ve
-       MARKET du structure co thang, tranh dat LIMIT vao noi ma gia se truot
-       qua ma khong khop.
-    5. Gia LIMIT dung _pick_structural_anchor: uu tien absorption > HVN > POC
-       > ATR pullback thuan tuy - tan dung het cau truc volume profile thay
-       vi chi 1 diem POC.
-
-    Tra ve dict: entry_type (MARKET/LIMIT), entry_price, reference_price,
-    momentum_contrib, structure_contrib, reason.
+    Tra ve dict: entry_type (MARKET/LIMIT), entry_price, reason.
     """
     direction = result.get("direction", "neutral")
     last_price = f.get("last_price", 0.0)
     if direction == "neutral" or not last_price:
-        return {
-            "entry_type": "MARKET", "entry_price": last_price,
-            "reference_price": last_price, "reason": "khong co huong ro rang",
-        }
+        return {"entry_type": "MARKET", "entry_price": last_price, "reason": "khong co huong ro rang"}
 
-    ref_price = _reference_price(f)
     sign = 1.0 if direction == "long" else -1.0
     module_scores = result.get("module_scores", {})
 
@@ -142,15 +60,9 @@ def classify_entry(f: dict, result: dict, weights: Dict[str, float]) -> dict:
             momentum_contrib += abs(contrib)
         elif name in STRUCTURE_MODULES or name in MEANREV_MODULES:
             structure_contrib += abs(contrib)
-        else:
-            # module moi chua duoc phan loai (vd them sau nay vao weights.json)
-            # -> mac dinh coi la structure (an toan hon: uu tien cho LIMIT thay
-            # vi vo tinh day ve MARKET voi 1 module chua ro ban chat).
-            structure_contrib += abs(contrib)
 
     regime = f.get("regime", "")
     spoof = f.get("spoof_score", 0.0)
-    persist = f.get("persist_score", 0.0)
     if regime == "high_volatility":
         momentum_contrib *= 1.15
     elif regime == "accumulation":
@@ -160,32 +72,32 @@ def classify_entry(f: dict, result: dict, weights: Dict[str, float]) -> dict:
         structure_contrib *= 1.3
 
     atr = f.get("atr15m", 0.0)
+    poc = f.get("volume_profile", {}).get("poc", 0.0)
 
     if momentum_contrib >= structure_contrib or not atr:
         return {
-            "entry_type": "MARKET", "entry_price": ref_price, "reference_price": ref_price,
-            "momentum_contrib": momentum_contrib, "structure_contrib": structure_contrib,
+            "entry_type": "MARKET",
+            "entry_price": last_price,
             "reason": f"momentum {momentum_contrib:.2f} >= structure {structure_contrib:.2f}",
         }
 
-    if persist < 0.25 and f.get("is_ws_tracked"):
-        # structure thang nhung sach lenh khong on dinh du de "nghi" LIMIT
-        # (chi ap dung khi co du lieu WS thuc, REST snapshot khong danh gia
-        # duoc persist_score nen bo qua kiem tra nay).
-        return {
-            "entry_type": "MARKET", "entry_price": ref_price, "reference_price": ref_price,
-            "momentum_contrib": momentum_contrib, "structure_contrib": structure_contrib,
-            "reason": f"structure thang nhung persist_score {persist:.2f} < 0.25 "
-                      "-> sach lenh khong on dinh de nghi LIMIT, chuyen MARKET",
-        }
-
-    anchor, anchor_reason = _pick_structural_anchor(f, direction, ref_price, atr)
-    entry_price = min(anchor, ref_price) if direction == "long" else max(anchor, ref_price)
+    # LIMIT: uu tien neo vao POC (vung volume/thanh khoan) neu POC nam trong
+    # 1.2x ATR va dung phia can cho gia lui ve; khong thi lui theo ATR (0.35x).
+    pullback = 0.35 * atr
+    if direction == "long":
+        use_poc = poc and poc <= last_price and (last_price - poc) <= 1.2 * atr
+        anchor = poc if use_poc else (last_price - pullback)
+        entry_price = min(anchor, last_price)
+    else:
+        use_poc = poc and poc >= last_price and (poc - last_price) <= 1.2 * atr
+        anchor = poc if use_poc else (last_price + pullback)
+        entry_price = max(anchor, last_price)
 
     return {
-        "entry_type": "LIMIT", "entry_price": entry_price, "reference_price": ref_price,
-        "momentum_contrib": momentum_contrib, "structure_contrib": structure_contrib,
-        "reason": f"structure {structure_contrib:.2f} > momentum {momentum_contrib:.2f} ({anchor_reason})",
+        "entry_type": "LIMIT",
+        "entry_price": entry_price,
+        "reason": f"structure {structure_contrib:.2f} > momentum {momentum_contrib:.2f}"
+        + (" (neo POC)" if 'use_poc' in locals() and use_poc else " (lui theo ATR)"),
     }
 
 
@@ -374,7 +286,6 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
     module_scores: Dict[str, float] = {}
     total = 0.0
     max_possible = 0.0
-    active_weight = 0.0  # tong weight cua CHI cac module thuc su len tieng (|raw|>0.05)
     votes_long = 0
     votes_short = 0
 
@@ -391,10 +302,8 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
         max_possible += w
         if raw > 0.05:
             votes_long += 1
-            active_weight += w
         elif raw < -0.05:
             votes_short += 1
-            active_weight += w
 
     if abs(votes_long - votes_short) <= 1 and (votes_long + votes_short) > 0:
         reasons.append("veto: mixed (vote long/short chenh <=1)")
@@ -415,26 +324,30 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
         total *= 0.75
         reasons.append(f"spoof_score {spoof_score:.2f} > 0.6 -> x0.75")
 
-    # Chuan hoa: TRUOC DAY chia thang cho max_possible (tong weight CA 12 module,
-    # ke ca 7-9 module dang im lang do dieu kien kich hoat chat - vd funding_extreme
-    # can |z|>=1.5, liquidity_sweep can 2 dieu kien AND...). Vi da so thoi diem chi
-    # 3-5/12 module len tieng, diem bi PHA LOANG co he thong, gan nhu khong bao gio
-    # cham THRESHOLD=65 du thi truong bien dong manh hay khong.
+    # --- CHAM DIEM (FIX) --------------------------------------------------
+    # Truoc day: magnitude = abs(total) / max_possible, voi max_possible la
+    # tong trong so CUA CA 12 MODULE (ke ca module dang im lang, raw=0). Vi
+    # moi vong thuong chi 3-5/12 module len tieng, mau so co dinh = tong 12
+    # module lam diem bi pha loang rat manh du cac module dang len tieng co
+    # dong thuan gan tuyet doi -> diem tran o muc rat thap (~35-42), gan
+    # nhu khong bao gio cham nguong 65 dung theo toan hoc.
     #
-    # Sua: dung trung binh NHAN giua max_possible (toan bo model) va active_weight
-    # (chi module dang len tieng) lam mau so - khong danh doi ve chat luong:
-    # - Neu chi 1 module hét to 1 minh -> active_weight nho -> mau so van bi keo
-    #   ve gan max_possible (vi sqrt(max*active) >> active khi active << max)
-    #   -> diem KHONG the vot len cao chi vi 1 module don le (khong de bi "gian lan").
-    # - Neu nhieu module (4-8/12) dong thuan that su -> active_weight lon hon ->
-    #   mau so nho lai gan active_weight hon -> diem phan anh dung do dong thuan,
-    #   khong con bi pha loang boi cac module VON DI khong the len tieng cung luc
-    #   (vd volume_profile chi len tieng khi gia sat POC, basis_spread chi len
-    #   tieng khi basis cuc doan - 2 dieu kien nay hiem khi xay ra dong thoi,
-    #   khong co nghia la tin hieu "yeu").
-    denom = (max_possible * active_weight) ** 0.5 if active_weight > 0 else max_possible
-    magnitude = abs(total) / denom if denom else 0.0
+    # Fix: chia cho tong trong so CUA CAC MODULE DANG LEN TIENG (active_weight)
+    # de do dung "do dong thuan trung binh" cua nhung module co y kien, roi
+    # nhan them he so "breadth" (ty le trong so dang len tieng / tong trong
+    # so toan bo) de van thuong cho viec co NHIEU module cung xac nhan -
+    # tranh truong hop 1-2 module hét to bi day diem gia tao. Khong doi
+    # module, khong doi weights.json, khong doi THRESHOLD, khong doi luat
+    # veto (mixed-vote o tren van giu nguyen).
+    active_weight = sum(weights[name] for name in module_scores if abs(module_scores[name]) > 0.05)
+    magnitude = abs(total) / active_weight if active_weight > 0 else 0.0
+
+    breadth = min(active_weight / max_possible, 1.0) if max_possible else 0.0
+    magnitude *= (0.5 + 0.5 * breadth)
+
     score = max(0.0, min(100.0, magnitude * 100.0))
+    # -----------------------------------------------------------------------
+
     confidence = magnitude
 
     if direction == "neutral" or score == 0.0:
@@ -455,35 +368,13 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
     }
 
 
-def suggested_sl_tp_multi(entry: float, direction: str, atr15m: float, atr4h: float,
-                           cfg: AppConfig) -> dict:
-    """
-    SL bam ATR15m (ngan han, sat gia - GIU NGUYEN theo yeu cau, khong doi khung).
-    TP 3 tang tinh theo ATR4h (dai han) thay vi ATR15m - day la thay doi cot loi
-    de TP thuc su "an duoc" vai % - vai chuc %, khong con la con so vo nghia:
-
-      TP1 = entry + tp1_atr4h_mult * atr4h  -> cham thi chot mot phan (tp1_close_pct),
-            doi SL ve breakeven (entry) - tu day tro di khong the lo nua.
-      TP2 = entry + tp2_atr4h_mult * atr4h  -> cham thi chot them (tp2_close_pct),
-            doi SL len TP1 - khoa lai phan loi da co.
-      TP3 = entry + tp3_atr4h_mult * atr4h  -> muc tieu xa. Sau khi cham TP2, phan
-            con lai KHONG cho gia den dung TP3 ma dung trailing stop (xem app.py,
-            trail_atr4h_mult) de "de loi chay" - day moi la cach thuc te de an
-            duoc vai chuc/vai tram % thay vi doan truoc mot con so co dinh.
-
-    Neu chua co du lieu atr4h (vi du data.py chua duoc cap nhat), tra ve entry
-    cho ca 4 gia tri de goi noi khong crash - can bo sung atr4h trong data.py.
-    """
-    if direction not in ("long", "short") or not atr4h:
-        return {"sl": entry, "tp1": entry, "tp2": entry, "tp3": entry}
-
-    sign = 1.0 if direction == "long" else -1.0
-    return {
-        "sl": entry - sign * cfg.sl_atr_mult * atr15m,
-        "tp1": entry + sign * cfg.tp1_atr4h_mult * atr4h,
-        "tp2": entry + sign * cfg.tp2_atr4h_mult * atr4h,
-        "tp3": entry + sign * cfg.tp3_atr4h_mult * atr4h,
-    }
+def suggested_sl_tp(entry: float, direction: str, atr15m: float) -> Tuple[float, float]:
+    """SL/TP tu ATR15m: SL = 0.8*ATR, TP = 1.5*ATR."""
+    if direction == "long":
+        return entry - 0.8 * atr15m, entry + 1.5 * atr15m
+    if direction == "short":
+        return entry + 0.8 * atr15m, entry - 1.5 * atr15m
+    return entry, entry
 
 
 def rank_top(results: List[dict], top_n: int = 5) -> List[dict]:
