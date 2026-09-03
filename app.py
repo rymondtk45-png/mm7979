@@ -403,6 +403,12 @@ class SignalEngine:
                     })
                 elif now - sig["created_at"] > self.cfg.signal_ttl_seconds:
                     # Limit cho qua lau khong khop -> huy, khong tinh la mot lenh da vao.
+                    # FIX: truoc day chi ghi log jsonl, nguoi dung khong biet kèo da
+                    # het han ma khong bao gio khop -> gio bao qua Telegram.
+                    self.bot.send_message(
+                        f"<b>{sym}</b> {direction.upper()} LIMIT <b>HET HAN</b> sau "
+                        f"{self.cfg.signal_ttl_seconds}s, chua khop tai {sig['entry_price']:.6g} "
+                        f"(gia hien tai {price:.6g}) - bo qua kèo nay.")
                     append_jsonl(self.cfg.resolve_path(self.cfg.log_path), {
                         "ts": now, "symbol": sym, "event": "limit_expired_unfilled",
                     })
@@ -428,9 +434,70 @@ class SignalEngine:
                 })
                 expired.append(sym)
             elif now - sig["created_at"] > self.cfg.signal_ttl_seconds:
+                # FIX: truoc day het TTL ma chua cham SL/TP thi bi am tham xoa
+                # khoi active_signals, khong bao gi ca -> nguoi dung tuong kèo
+                # con "song". Gio bao ro la het han theo doi, khong con canh
+                # bao gi them (khong phai la SL/TP that su, chi la het thoi
+                # gian bot theo doi).
+                self.bot.send_message(
+                    f"<b>{sym}</b> {direction.upper()} <b>HET HAN theo doi</b> sau "
+                    f"{self.cfg.signal_ttl_seconds}s tu luc vao, chua cham SL/TP "
+                    f"(gia hien tai {price:.6g}) - bot ngung theo doi kèo nay.")
+                append_jsonl(self.cfg.resolve_path(self.cfg.log_path), {
+                    "ts": now, "symbol": sym, "event": "signal_ttl_expired", "price": price,
+                })
                 expired.append(sym)
         for sym in expired:
             self.active_signals.pop(sym, None)
+
+    def _check_signal_health(self, results: List[dict]) -> None:
+        """Tinh nang MOI: moi vong quet, doi voi cac kèo dang active_signals,
+        neu symbol do nam trong ket qua quet vong nay (results), so lai
+        huong/veto MOI NHAT voi huong luc vao kèo. Neu tinh hinh xau di ro
+        ret (bi veto tro lai, hoac huong dao chieu) thi BAO 1 LAN qua
+        Telegram "tin hieu xau - can nhac bo kèo". Neu van tot (cung huong,
+        khong bi veto) thi IM LANG - khong nhan tin gi ca, tranh spam.
+
+        Khong tu dong xoa kèo khoi active_signals hay huy SL/TP - nguoi dung
+        van tu quyet dinh (dung theo triet ly "KHONG DAT LENH" cua bot).
+        Neu sau khi bi canh bao ma tinh hinh hoi phuc tro lai (cung huong,
+        khong veto) thi am tham bo canh bao (khong nhan tin "da tot lai"
+        de tranh spam 2 chieu, dung y "neu tot thi khong noi gi het").
+
+        Chi re-check duoc cho symbol nao ro rang co mat trong scan set vong
+        nay (results) - alt coin nao rot khoi scan set (vd het hot, khong
+        con trong top volume) se khong duoc re-check vong do, van tiep tuc
+        theo doi SL/TP/TTL binh thuong o _check_hits_and_expiry.
+        """
+        if not self.cfg.enable_signal_health_alert:
+            return
+        fresh_by_symbol = {r["symbol"]: r for r in results}
+        for sym, sig in list(self.active_signals.items()):
+            fresh = fresh_by_symbol.get(sym)
+            if fresh is None:
+                continue
+            orig_dir = sig["direction"]
+            fresh_dir = fresh["direction"]
+            turned_bad = fresh.get("veto") or fresh_dir == "neutral" or fresh_dir != orig_dir
+            if turned_bad and not sig.get("warned_bad"):
+                reason = fresh.get("veto_reason") or "huong da dao chieu / khong con ro rang"
+                self.bot.send_message(
+                    f"⚠️ <b>{sym}</b> {orig_dir.upper()} - <b>TIN HIEU XAU DI</b>, can nhac bo kèo.\n"
+                    f"Luc vao: {orig_dir.upper()} | Quet lai vua roi: "
+                    f"{fresh_dir.upper() if fresh_dir != 'neutral' else 'NEUTRAL'} "
+                    f"(score={fresh.get('score', 0):.1f})\n"
+                    f"Ly do: {reason}\n"
+                    f"(Bot van tiep tuc theo doi SL/TP nhu binh thuong, day chi la canh bao "
+                    f"tham khao - ban tu quyet dinh giu hay dong kèo.)")
+                append_jsonl(self.cfg.resolve_path(self.cfg.log_path), {
+                    "ts": time.time(), "symbol": sym, "event": "signal_turned_bad",
+                    "orig_direction": orig_dir, "fresh_direction": fresh_dir,
+                    "fresh_score": fresh.get("score", 0), "reason": reason,
+                })
+                sig["warned_bad"] = True
+            elif not turned_bad and sig.get("warned_bad"):
+                # Hoi phuc tro lai - im lang bo canh bao, khong nhan tin gi them.
+                sig["warned_bad"] = False
 
     def _process_symbol(self, symbol: str, is_core: bool, is_ws: bool) -> Optional[dict]:
         """Chay trong 1 worker thread. Tra ve result dict hoac None neu loi.
@@ -497,6 +564,7 @@ class SignalEngine:
                 }
 
         self._check_hits_and_expiry(current_prices)
+        self._check_signal_health(results)
         self._check_scan_updates()
 
         top5 = rank_top(results, 5)

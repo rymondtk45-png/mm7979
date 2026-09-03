@@ -117,6 +117,10 @@ class AppConfig:
     book_persist_ms: int = field(default_factory=lambda: _get_int("BOOK_PERSIST_MS", 1000))
     profile_tick_buckets: int = field(default_factory=lambda: _get_int("PROFILE_TICK_BUCKETS", 40))
     signal_ttl_seconds: int = field(default_factory=lambda: _get_int("SIGNAL_TTL_SECONDS", 2400))
+    # Tinh nang MOI: canh bao khi kèo dang active bi "xau di" giua chung (bi
+    # veto tro lai hoac dao chieu) - xem app.py _check_signal_health().
+    enable_signal_health_alert: bool = field(
+        default_factory=lambda: _get_bool("ENABLE_SIGNAL_HEALTH_ALERT", True))
 
     # --- /scan <symbol> theo doi thu cong ---
     # FIX: 2 field nay bi thieu -> AttributeError 'scan_max_subscriptions' khi
