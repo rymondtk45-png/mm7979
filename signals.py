@@ -297,6 +297,7 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
 
     module_scores: Dict[str, float] = {}
     total = 0.0
+    total_significant = 0.0
     max_possible = 0.0
     active_weight_sum = 0.0
     votes_long = 0
@@ -316,9 +317,11 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
         if raw > 0.05:
             votes_long += 1
             active_weight_sum += w
+            total_significant += raw * w
         elif raw < -0.05:
             votes_short += 1
             active_weight_sum += w
+            total_significant += raw * w
 
     if abs(votes_long - votes_short) <= 1 and (votes_long + votes_short) > 0:
         reasons.append("veto: mixed (vote long/short chenh <=1)")
@@ -332,14 +335,20 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
 
     if f.get("bias_4h") != "neutral" and f.get("bias_4h") == direction:
         total *= 1.15
+        total_significant *= 1.15
         reasons.append("4h aligned x1.15")
 
     spoof_score = f.get("spoof_score", 0.0)
     if spoof_score > 0.6:
         total *= 0.75
+        total_significant *= 0.75
         reasons.append(f"spoof_score {spoof_score:.2f} > 0.6 -> x0.75")
 
-    raw_magnitude = abs(total) / active_weight_sum if active_weight_sum else 0.0
+    # Dung total_significant (chi tong hop cac module DA duoc tinh vao active_weight_sum)
+    # thay vi total (gom ca module raw yeu duoi nguong 0.05) de raw_magnitude luon
+    # bound chat che trong [0,1] truoc khi nhan he so 4h/spoof - dung logic voi dinh
+    # nghia "module da len tieng" dung o ca tu so va mau so.
+    raw_magnitude = abs(total_significant) / active_weight_sum if active_weight_sum else 0.0
     participation_ratio = active_weight_sum / max_possible if max_possible else 0.0
     participation_factor = math.sqrt(max(participation_ratio, 0.0))
     magnitude = raw_magnitude * participation_factor
