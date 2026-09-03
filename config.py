@@ -121,6 +121,15 @@ class AppConfig:
     # veto tro lai hoac dao chieu) - xem app.py _check_signal_health().
     enable_signal_health_alert: bool = field(
         default_factory=lambda: _get_bool("ENABLE_SIGNAL_HEALTH_ALERT", True))
+    # FIX: truoc day chi can 1 vong quet (~poll_seconds, mac dinh 25s) thay
+    # phieu bau lech nhau la bao "TIN HIEU XAU DI" ngay. Cac module vote
+    # (tape_flow, taker_buy_sell_ratio, order_book_imbalance...) la du lieu
+    # ngan han/tick-level nen rat de nhay qua lai quanh nguong 0.05 chi trong
+    # vai chuc giay, du thi truong khong doi huong that su -> canh bao gan
+    # nhu 100% kèo nao cung dinh chi sau 1 vong. Gio yeu cau NHIEU vong quet
+    # LIEN TIEP deu "xau" moi bao 1 lan, giam canh bao gia do nhieu ngan han.
+    signal_health_confirm_scans: int = field(
+        default_factory=lambda: _get_int("SIGNAL_HEALTH_CONFIRM_SCANS", 3))
 
     # --- /scan <symbol> theo doi thu cong ---
     # FIX: 2 field nay bi thieu -> AttributeError 'scan_max_subscriptions' khi

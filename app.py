@@ -454,23 +454,39 @@ class SignalEngine:
         """Tinh nang MOI: moi vong quet, doi voi cac kèo dang active_signals,
         neu symbol do nam trong ket qua quet vong nay (results), so lai
         huong/veto MOI NHAT voi huong luc vao kèo. Neu tinh hinh xau di ro
-        ret (bi veto tro lai, hoac huong dao chieu) thi BAO 1 LAN qua
-        Telegram "tin hieu xau - can nhac bo kèo". Neu van tot (cung huong,
-        khong bi veto) thi IM LANG - khong nhan tin gi ca, tranh spam.
+        ret VA LIEN TUC trong nhieu vong quet lien tiep (xem
+        signal_health_confirm_scans) thi BAO 1 LAN qua Telegram "tin hieu
+        xau - can nhac bo kèo". Neu van tot (cung huong, khong bi veto) thi
+        IM LANG - khong nhan tin gi ca, tranh spam.
+
+        FIX quan trong: truoc day chi 1 vong quet (~poll_seconds giay) thay
+        veto/dao chieu la bao ngay. Cac module vote (tape_flow,
+        taker_buy_sell_ratio, order_book_imbalance...) la du lieu ngan han,
+        rat de dao qua lai quanh nguong 0.05 trong vai chuc giay du thi
+        truong khong doi huong that su -> gan nhu kèo nao vua bao xong cung
+        dinh canh bao "xau di" ngay vong quet ke tiep, dung mot phan y het
+        du lieu vua dung de tao ra tin hieu do. Gio can nhieu vong quet LIEN
+        TIEP (mac dinh 3, ~signal_health_confirm_scans * poll_seconds giay)
+        deu cho ket qua xau (veto/dao chieu/neutral) moi tinh la "xau that",
+        chi 1 vong le te bi nhieu ngan han se KHONG lam tang canh bao.
 
         Khong tu dong xoa kèo khoi active_signals hay huy SL/TP - nguoi dung
         van tu quyet dinh (dung theo triet ly "KHONG DAT LENH" cua bot).
         Neu sau khi bi canh bao ma tinh hinh hoi phuc tro lai (cung huong,
-        khong veto) thi am tham bo canh bao (khong nhan tin "da tot lai"
-        de tranh spam 2 chieu, dung y "neu tot thi khong noi gi het").
+        khong veto) thi am tham bo canh bao va reset chuoi xau (khong nhan
+        tin "da tot lai" de tranh spam 2 chieu, dung y "neu tot thi khong
+        noi gi het").
 
         Chi re-check duoc cho symbol nao ro rang co mat trong scan set vong
         nay (results) - alt coin nao rot khoi scan set (vd het hot, khong
         con trong top volume) se khong duoc re-check vong do, van tiep tuc
-        theo doi SL/TP/TTL binh thuong o _check_hits_and_expiry.
+        theo doi SL/TP/TTL binh thuong o _check_hits_and_expiry. Nhung vong
+        bi bo qua nhu vay KHONG lam tang/giam bad_streak - chi dem cac vong
+        thuc su co du lieu moi.
         """
         if not self.cfg.enable_signal_health_alert:
             return
+        confirm_needed = max(1, self.cfg.signal_health_confirm_scans)
         fresh_by_symbol = {r["symbol"]: r for r in results}
         for sym, sig in list(self.active_signals.items()):
             fresh = fresh_by_symbol.get(sym)
@@ -479,20 +495,26 @@ class SignalEngine:
             orig_dir = sig["direction"]
             fresh_dir = fresh["direction"]
             turned_bad = fresh.get("veto") or fresh_dir == "neutral" or fresh_dir != orig_dir
-            if turned_bad and not sig.get("warned_bad"):
+            if turned_bad:
+                sig["bad_streak"] = sig.get("bad_streak", 0) + 1
+            else:
+                sig["bad_streak"] = 0
+            if (turned_bad and not sig.get("warned_bad")
+                    and sig["bad_streak"] >= confirm_needed):
                 reason = fresh.get("veto_reason") or "huong da dao chieu / khong con ro rang"
                 self.bot.send_message(
                     f"⚠️ <b>{sym}</b> {orig_dir.upper()} - <b>TIN HIEU XAU DI</b>, can nhac bo kèo.\n"
                     f"Luc vao: {orig_dir.upper()} | Quet lai vua roi: "
                     f"{fresh_dir.upper() if fresh_dir != 'neutral' else 'NEUTRAL'} "
                     f"(score={fresh.get('score', 0):.1f})\n"
-                    f"Ly do: {reason}\n"
+                    f"Ly do: {reason} (da xau lien tuc {sig['bad_streak']} vong quet)\n"
                     f"(Bot van tiep tuc theo doi SL/TP nhu binh thuong, day chi la canh bao "
                     f"tham khao - ban tu quyet dinh giu hay dong kèo.)")
                 append_jsonl(self.cfg.resolve_path(self.cfg.log_path), {
                     "ts": time.time(), "symbol": sym, "event": "signal_turned_bad",
                     "orig_direction": orig_dir, "fresh_direction": fresh_dir,
                     "fresh_score": fresh.get("score", 0), "reason": reason,
+                    "bad_streak": sig["bad_streak"],
                 })
                 sig["warned_bad"] = True
             elif not turned_bad and sig.get("warned_bad"):
@@ -561,6 +583,7 @@ class SignalEngine:
                     "direction": result["direction"], "entry_price": entry_price,
                     "entry_type": entry_info["entry_type"], "sl": sl, "tp": tp,
                     "created_at": now, "filled": entry_info["entry_type"] == "MARKET",
+                    "bad_streak": 0, "warned_bad": False,
                 }
 
         self._check_hits_and_expiry(current_prices)

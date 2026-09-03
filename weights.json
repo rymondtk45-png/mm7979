@@ -10,5 +10,12 @@
   "taker_buy_sell_ratio": 0.6,
   "long_short_ratio": 0.6,
   "order_book_imbalance": 0.5,
-  "cross_exchange_divergence": 0.5
+  "cross_exchange_divergence": 0.5,
+
+  "open_interest_trend": 1.0,
+  "whale_retail_flow": 1.0,
+  "btc_regime_filter": 0.7,
+  "funding_spread_cross_exchange": 0.6,
+
+  "options_skew": 0.3
 }
