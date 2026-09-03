@@ -1,82 +1,26 @@
 """
 signals.py
-Module score + luat HTF veto + composite + ranking.
 
+Module score + luat HTF veto + composite + ranking.
 Moi module tra ve signed float trong [-1, 1]: duong = nghieng long, am = nghieng short,
 do lon = do tin cay module do. Composite = sum(module_score * weight), sau do chuan hoa 0-100.
-
-=== THAY DOI SO VOI BAN GOC ===
-1. FIX BUG veto "weak consensus": ban goc dung `abs(votes_long - votes_short) <= 1`
-   (khong kiem tra so luong module co y kien) -> veto qua thuong xuyen, sai voi
-   README (README noi "can it nhat 4 module co y kien VA chenh lech >= 3"). Da
-   sua lai dung theo README.
-2. Them 4 module moi:
-   - open_interest_trend: OI tang/giam ket hop huong gia -> phan biet "tien moi
-     vao" hay "dong vi the cu / short-cover".
-   - whale_retail_flow: tach CVD lenh lon (whale) khoi lenh nho (retail) tu
-     chinh tape dang co san.
-   - btc_regime_filter: dung bias 1h/4h + regime cua BTC lam boi canh macro cho
-     alt (khong ap dung cho chinh BTC/ETH).
-   - funding_spread_cross_exchange: chenh lech funding Binance vs cac san khac
-     (chi co du lieu cho CORE_SYMBOLS).
-3. module_volume_profile nay dung them Value Area (VAH/VAL) thay vi chi nhin
-   POC don le: trong Value Area -> nghieng mean-reversion ve POC (giu logic cu),
-   pha khoi VAH/VAL -> nghieng breakout theo huong pha.
-4. classify_entry(): them dieu chinh nhe theo VPIN (do doc hai dong lenh) - VPIN
-   cao -> uu tien LIMIT de tranh truot gia khi vao MARKET.
-5. FIX BUG CRASH "'float' object has no attribute 'get'": data.py HIEN TAI tra
-   ve f["open_interest"] la Optional[float] (gia tri OI tho), CHUA phai dict
-   {"value","pct_change","z"} nhu INTEGRATION_GUIDE.md mo ta. Vi key nay LUON
-   TON TAI trong dict f (data.py luon set no, du la None hay float), nen
-   f.get("open_interest", {}) khong bao gio tra ve {} mac dinh - no tra dung
-   cai float/None do, roi goi .get() len no -> crash. Da them guard
-   isinstance(..., dict) cho open_interest_trend, whale_retail_flow va
-   btc_regime_filter (3 module doc field dang dict tu f) de KHONG crash khi
-   data.py chua cung cap dung dinh dang - cac module nay se tra ve 0.0 (khong
-   co y kien) cho toi khi data.py duoc cap nhat dung "hop dong" du lieu.
-
-Cac field moi trong dict `f` (features) ma cac ham nay doc - can duoc `data.py`
-cung cap (xem INTEGRATION_GUIDE.md):
-  f["open_interest"] = {"value": float, "pct_change": float, "z": float}
-  f["price_change_15m_pct"] = float
-  f["whale_flow"] = {"whale_cvd": float, "retail_cvd": float, "whale_ratio": float}
-  f["btc_regime"] = {"bias_1h": str, "bias_4h": str, "regime": str}
-  f["funding_spread_cross"] = Optional[float]
-  f["vpin"] = float  (0..1, cang cao cang "doc hai"/nhieu thong tin bat can xung)
-  f["volume_profile"]["vah"], f["volume_profile"]["val"] = float (Value Area)
-
-  LUU Y (xem muc 5 o tren): open_interest_trend, whale_retail_flow va
-  btc_regime_filter se tu tra ve 0.0 mot cach an toan neu data.py chua cung
-  cap dung dinh dang dict o tren (thay vi crash ca vong quet symbol).
 """
+
 from __future__ import annotations
 
+import math
 from typing import Dict, List, Tuple
 
 from config import AppConfig
 
 LEGACY_MODULES = ["volume_profile", "tape_flow", "liquidation_impulse", "funding_extreme"]
 
-
-def _as_dict(value) -> dict:
-    """
-    Helper an toan: tra ve `value` neu no la dict, nguoc lai tra ve {} rong.
-    Dung o moi cho doc field ma module DANG KY VONG la dict (open_interest,
-    whale_flow, btc_regime...) nhung data.py co the dang tra ve kieu khac
-    (float, None, chua co key...) - tranh crash 'X object has no attribute get'.
-    """
-    return value if isinstance(value, dict) else {}
-
-
 # --------------------------------------------------------------------------
 # Phan loai LIMIT vs MARKET theo BAN CHAT cua module dang dan dat tin hieu
 # --------------------------------------------------------------------------
 # MOMENTUM: gia dang chay theo huong tin hieu NGAY LUC NAY (aggression/breakout/
 # cascade dang xay ra). Cho retest = de mat edge hoac mat hang -> MARKET.
-MOMENTUM_MODULES = {
-    "tape_flow", "taker_buy_sell_ratio", "liquidity_sweep", "liquidation_impulse",
-    "open_interest_trend", "whale_retail_flow",
-}
+MOMENTUM_MODULES = {"tape_flow", "taker_buy_sell_ratio", "liquidity_sweep", "liquidation_impulse"}
 
 # STRUCTURE: tin hieu dua tren 1 vung gia/muc thanh khoan cu the (POC, sach lenh
 # ben vung) - gia thuong quay lai test vung do truoc khi di tiep -> LIMIT tai vung.
@@ -85,10 +29,7 @@ STRUCTURE_MODULES = {"volume_profile", "absorption", "persistent_book", "order_b
 # MEAN-REVERSION: tin hieu contrarian tu trang thai qua mua/qua ban (funding,
 # basis, LSR, chenh lech gia lien san) - dien bien cham, khong can vao ngay,
 # thuong co du thoi gian cho gia lui ve muc tot hon -> LIMIT.
-MEANREV_MODULES = {
-    "funding_extreme", "basis_spread", "long_short_ratio", "cross_exchange_divergence",
-    "funding_spread_cross_exchange", "btc_regime_filter",
-}
+MEANREV_MODULES = {"funding_extreme", "basis_spread", "long_short_ratio", "cross_exchange_divergence"}
 
 
 def classify_entry(f: dict, result: dict, weights: Dict[str, float]) -> dict:
@@ -96,8 +37,8 @@ def classify_entry(f: dict, result: dict, weights: Dict[str, float]) -> dict:
     Quyet dinh LIMIT hay MARKET dua tren TOAN BO dong gop cua cac module (khong
     chi module manh nhat) - so sanh tong dong gop (raw*weight, cung chieu voi
     huong tin hieu cuoi cung) cua nhom MOMENTUM vs nhom STRUCTURE+MEAN-REVERSION.
-    Regime, spoof_score va VPIN dieu chinh nhe theo boi canh (high_volatility day
-    ve MARKET, accumulation/spoof/VPIN cao nghi ngo day ve LIMIT).
+    Regime va spoof_score dieu chinh nhe theo boi canh (high_volatility day ve
+    MARKET, accumulation/spoof nghi ngo day ve LIMIT).
 
     Tra ve dict: entry_type (MARKET/LIMIT), entry_price, reason.
     """
@@ -108,6 +49,7 @@ def classify_entry(f: dict, result: dict, weights: Dict[str, float]) -> dict:
 
     sign = 1.0 if direction == "long" else -1.0
     module_scores = result.get("module_scores", {})
+
     momentum_contrib = 0.0
     structure_contrib = 0.0
     for name, raw in module_scores.items():
@@ -121,7 +63,6 @@ def classify_entry(f: dict, result: dict, weights: Dict[str, float]) -> dict:
 
     regime = f.get("regime", "")
     spoof = f.get("spoof_score", 0.0)
-    vpin = f.get("vpin", 0.0)
     if regime == "high_volatility":
         momentum_contrib *= 1.15
     elif regime == "accumulation":
@@ -129,13 +70,10 @@ def classify_entry(f: dict, result: dict, weights: Dict[str, float]) -> dict:
     if spoof > 0.6:
         # sach lenh nghi bi gia lap -> khong nen duoi gia bang market
         structure_contrib *= 1.3
-    if vpin > 0.4:
-        # dong lenh dang "doc hai" (mat can bang buy/sell manh trong tung cum
-        # volume) -> de bi truot gia neu vao MARKET, uu tien cho khop LIMIT
-        structure_contrib *= 1.2
 
     atr = f.get("atr15m", 0.0)
     poc = f.get("volume_profile", {}).get("poc", 0.0)
+
     if momentum_contrib >= structure_contrib or not atr:
         return {
             "entry_type": "MARKET",
@@ -146,12 +84,13 @@ def classify_entry(f: dict, result: dict, weights: Dict[str, float]) -> dict:
     # LIMIT: uu tien neo vao POC (vung volume/thanh khoan) neu POC nam trong
     # 1.2x ATR va dung phia can cho gia lui ve; khong thi lui theo ATR (0.35x).
     pullback = 0.35 * atr
+    use_poc = False
     if direction == "long":
-        use_poc = poc and poc <= last_price and (last_price - poc) <= 1.2 * atr
+        use_poc = bool(poc) and poc <= last_price and (last_price - poc) <= 1.2 * atr
         anchor = poc if use_poc else (last_price - pullback)
         entry_price = min(anchor, last_price)
     else:
-        use_poc = poc and poc >= last_price and (poc - last_price) <= 1.2 * atr
+        use_poc = bool(poc) and poc >= last_price and (poc - last_price) <= 1.2 * atr
         anchor = poc if use_poc else (last_price + pullback)
         entry_price = max(anchor, last_price)
 
@@ -159,7 +98,7 @@ def classify_entry(f: dict, result: dict, weights: Dict[str, float]) -> dict:
         "entry_type": "LIMIT",
         "entry_price": entry_price,
         "reason": f"structure {structure_contrib:.2f} > momentum {momentum_contrib:.2f}"
-        + (" (neo POC)" if 'use_poc' in locals() and use_poc else " (lui theo ATR)"),
+        + (" (neo POC)" if use_poc else " (lui theo ATR)"),
     }
 
 
@@ -193,38 +132,20 @@ def _dir_sign(direction: str) -> float:
 
 
 def module_volume_profile(f: dict) -> float:
-    """
-    Vi the o vung volume cao (POC/HVN) + delta_at_poc xac nhan huong (mean-
-    reversion trong Value Area), HOAC pha khoi Value Area (VAH/VAL) -> nghieng
-    breakout theo huong pha. Neu data.py chua co vah/val (ban cu), tu dong roi
-    ve logic POC-only nhu truoc (backward compatible).
-    """
+    """Vi the o vung volume cao (POC/HVN) + delta_at_poc xac nhan huong."""
     vp = f.get("volume_profile", {})
     last = f.get("last_price", 0.0)
     poc = vp.get("poc", 0.0)
     if not poc or not last:
         return 0.0
-
     distance = vp.get("distance_to_poc", 0.0)
     near_poc = abs(distance) < 0.003  # gia dang o gan POC
     delta = vp.get("delta_at_poc", 0.0)
-
-    vah = vp.get("vah")
-    val = vp.get("val")
-    has_value_area = vah is not None and val is not None and vah > 0 and val > 0
-
-    if near_poc:
-        strength = min(abs(delta) / (abs(delta) + 1e-6 + 1.0), 1.0) if delta else 0.0
-        sign = 1.0 if delta > 0 else (-1.0 if delta < 0 else 0.0)
-        return sign * max(strength, 0.3 if near_poc else 0.0)
-
-    if has_value_area:
-        if last > vah:
-            return 0.6  # pha VAH -> breakout long
-        if last < val:
-            return -0.6  # pha VAL -> breakout short
-
-    return 0.0
+    if not near_poc:
+        return 0.0
+    strength = min(abs(delta) / (abs(delta) + 1e-6 + 1.0), 1.0) if delta else 0.0
+    sign = 1.0 if delta > 0 else (-1.0 if delta < 0 else 0.0)
+    return sign * max(strength, 0.3 if near_poc else 0.0)
 
 
 def module_tape_flow(f: dict) -> float:
@@ -328,132 +249,6 @@ def module_cross_exchange_divergence(f: dict) -> float:
     return max(-1.0, min(1.0, div * 50.0))
 
 
-def module_open_interest_trend(f: dict) -> float:
-    """
-    OI tang + gia tang -> long moi mo (xu huong that, tin cay hon).
-    OI tang + gia giam -> short moi mo (ap luc ban that).
-    OI giam (dong vi the / short-cover hoac long chot loi) -> van nghieng theo
-    chieu gia nhung giam trong so vi day thuong la dau hieu "sap het da" chu
-    khong phai dong tien moi.
-    Can f["open_interest"]["pct_change"] va f["price_change_15m_pct"] (xem
-    INTEGRATION_GUIDE.md de biet cach data.py cung cap 2 field nay).
-
-    FIX: data.py hien tai co the tra f["open_interest"] la float/None (chua
-    phai dict) - dung _as_dict() de tranh crash 'float' object has no
-    attribute 'get'; neu chua dung dinh dang, module tra ve 0.0 (bo qua,
-    khong co y kien) thay vi lam sap ca vong quet symbol.
-    """
-    oi = _as_dict(f.get("open_interest"))
-    if not oi:
-        return 0.0
-    oi_pct = oi.get("pct_change", 0.0)
-    price_pct = f.get("price_change_15m_pct", 0.0)
-    if abs(oi_pct) < 0.005 or abs(price_pct) < 0.0005:
-        return 0.0
-    sign = 1.0 if price_pct > 0 else -1.0
-    strength = min(abs(oi_pct) / 0.05, 1.0)
-    if oi_pct < 0:
-        strength *= 0.6  # OI giam -> tin hieu yeu hon (co the sap het da)
-    return sign * strength
-
-
-def module_whale_retail_flow(f: dict) -> float:
-    """
-    Tach CVD lenh lon (whale/block) khoi lenh nho (retail) trong cung 1 cua so
-    thoi gian. Whale CVD manh + retail dang doi dau (trai dau) -> tin hieu
-    "smart money" sach hon CVD gop chung. Ty trong volume tu whale qua thap
-    (< 10%) -> giam do tin cay vi mau qua nho.
-    Can f["whale_flow"] = {"whale_cvd", "retail_cvd", "whale_ratio"} (xem
-    INTEGRATION_GUIDE.md - lay tu TradeTape dang co san, khong can data nguon
-    moi).
-
-    FIX: dung _as_dict() de tranh crash neu data.py chua cung cap field nay
-    dung dinh dang dict - tra ve 0.0 an toan.
-    """
-    wf = _as_dict(f.get("whale_flow"))
-    if not wf:
-        return 0.0
-    whale_cvd = wf.get("whale_cvd", 0.0)
-    retail_cvd = wf.get("retail_cvd", 0.0)
-    whale_ratio = wf.get("whale_ratio", 0.0)
-    if whale_cvd == 0:
-        return 0.0
-    sign = 1.0 if whale_cvd > 0 else -1.0
-    conflict_bonus = 0.2 if (retail_cvd != 0 and (retail_cvd > 0) != (whale_cvd > 0)) else 0.0
-    strength = min(abs(whale_cvd) / (abs(whale_cvd) + abs(retail_cvd) + 1e-6), 1.0)
-    strength = min(strength + conflict_bonus, 1.0)
-    if whale_ratio < 0.1:
-        strength *= 0.3
-    return sign * strength
-
-
-def module_btc_regime_filter(f: dict) -> float:
-    """
-    Boi canh macro cho alt: BTC dang trending 1 chieu ro rang (1h VA 4h cung
-    huong, khong phai high_volatility) -> nghieng nhe theo chieu do cho ca alt.
-    BTC dang mau thuan/hon loan -> tra ve 0 (khong ap dat huong). KHONG ap
-    dung cho chinh BTC/ETH (tu no la market leader).
-    Can f["btc_regime"] = {"bias_1h", "bias_4h", "regime"} - tinh 1 lan/vong
-    quet, dung chung cho moi symbol (xem INTEGRATION_GUIDE.md).
-
-    FIX: dung _as_dict() de tranh crash neu data.py chua cung cap field nay
-    dung dinh dang dict - tra ve 0.0 an toan.
-    """
-    symbol = f.get("symbol", "")
-    if symbol.startswith("BTC") or symbol.startswith("ETH"):
-        return 0.0
-    btc = _as_dict(f.get("btc_regime"))
-    if not btc:
-        return 0.0
-    b1h, b4h, regime = btc.get("bias_1h"), btc.get("bias_4h"), btc.get("regime")
-    if not b1h or not b4h:
-        return 0.0
-    if regime == "high_volatility":
-        return 0.0
-    if b1h != "neutral" and b4h != "neutral" and b1h != b4h:
-        return 0.0
-    if b1h == b4h and b1h in ("long", "short"):
-        return 0.5 if b1h == "long" else -0.5
-    return 0.0
-
-
-def module_funding_spread_cross_exchange(f: dict) -> float:
-    """
-    Chenh lech funding rate giua Binance va cac san khac (chi co du lieu voi
-    CORE_SYMBOLS, dung chung ha tang cross-exchange dang co san trong data.py).
-    Spread duong lon (Binance funding cao han han) -> Binance dang bi crowd
-    long rieng le -> nghieng short mean-revert manh hon funding_extreme don san.
-    Can f["funding_spread_cross"]: Optional[float] (None neu khong co du lieu
-    - vd voi alt ngoai CORE_SYMBOLS).
-    """
-    spread = f.get("funding_spread_cross")
-    if spread is None or abs(spread) < 0.0003:
-        return 0.0
-    sign = -1.0 if spread > 0 else 1.0
-    return sign * min(abs(spread) / 0.002, 1.0)
-
-
-def module_options_skew(f: dict) -> float:
-    """
-    Boi canh macro tu Deribit BTC put/call IV skew (xem canh bao do tin cay
-    trong data_additions.py phan 9 - day la xap xi 25-delta THO, chua tu kiem
-    chung voi API that). Tuong tu btc_regime_filter: dung skew cua BTC lam
-    proxy risk-on/risk-off chung cho ca thi truong, KHONG ap dung cho chinh
-    BTC (tranh vong lap tu tham chieu chinh no). Nhan 0.6 de giam bien do vi
-    day la tin hieu macro gian tiep, khong phai do truc tiep tren chinh coin
-    dang xet (khac voi vd BTC co san option rieng nhung chua wiring o day).
-    Can f["options_skew"]: Optional[float] trong [-1,1], None neu khong lay
-    duoc du lieu Deribit vong nay.
-    """
-    symbol = f.get("symbol", "")
-    if symbol.startswith("BTC"):
-        return 0.0
-    skew = f.get("options_skew")
-    if skew is None:
-        return 0.0
-    return max(-1.0, min(1.0, skew * 0.6))
-
-
 MODULE_FUNCS = {
     "volume_profile": module_volume_profile,
     "tape_flow": module_tape_flow,
@@ -467,12 +262,6 @@ MODULE_FUNCS = {
     "long_short_ratio": module_long_short_ratio,
     "order_book_imbalance": module_order_book_imbalance,
     "cross_exchange_divergence": module_cross_exchange_divergence,
-    # --- Module moi ---
-    "open_interest_trend": module_open_interest_trend,
-    "whale_retail_flow": module_whale_retail_flow,
-    "btc_regime_filter": module_btc_regime_filter,
-    "funding_spread_cross_exchange": module_funding_spread_cross_exchange,
-    "options_skew": module_options_skew,
 }
 
 
@@ -480,10 +269,22 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
     """
     Tra ve dict: score(0-100), direction(long/short/neutral), confidence(0-1),
     reasons(list[str]), veto(bool), veto_reason(str), module_scores(dict).
+
+    CONG THUC DIEM (da sua):
+    - raw_magnitude = |total| / active_weight_sum: do do MANH/DONG THUAN THUC SU
+      cua rieng cac module DA LEN TIENG (khong bi pha loang boi module im lang).
+    - participation_factor = sqrt(active_weight_sum / max_possible): phat MOT LAN
+      DUY NHAT vi dien bao phu hep (it module tham gia).
+    - magnitude = raw_magnitude * participation_factor.
+      (Ban cu chia total cho max_possible RỒI nhan them participation_factor
+      -> phat trung 2 lan viec it module len tieng, khien nhom core dong thuan
+      tuyet doi cung khong bao gio dat diem cao hop ly.)
     """
     reasons: List[str] = []
-    allowed, htf_reason = htf_check(f.get("bias_15m", "neutral"), f.get("bias_1h", "neutral"),
-                                     f.get("bias_4h", "neutral"), cfg)
+
+    allowed, htf_reason = htf_check(
+        f.get("bias_15m", "neutral"), f.get("bias_1h", "neutral"), f.get("bias_4h", "neutral"), cfg
+    )
     reasons.append(htf_reason)
     if not allowed:
         return {
@@ -493,11 +294,14 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
         }
 
     active_modules = LEGACY_MODULES if not cfg.enable_market_intel_scoring else list(weights.keys())
+
     module_scores: Dict[str, float] = {}
     total = 0.0
     max_possible = 0.0
+    active_weight_sum = 0.0
     votes_long = 0
     votes_short = 0
+
     for name in active_modules:
         if name not in weights:
             continue
@@ -511,24 +315,16 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
         max_possible += w
         if raw > 0.05:
             votes_long += 1
+            active_weight_sum += w
         elif raw < -0.05:
             votes_short += 1
+            active_weight_sum += w
 
-    # --- FIX: veto "weak consensus" dung theo README (ban goc dung sai, xem
-    # docstring dau file) ---
-    # Dieu kien de KHONG bi veto: it nhat 4 module co y kien (raw > 0.05 hoac
-    # < -0.05) VA chenh lech phieu long/short >= 3. Neu khong thoa (qua it
-    # module len tieng, HOAC nhieu module len tieng nhung chia phe gan deu
-    # nhau) -> veto "weak consensus".
-    total_votes = votes_long + votes_short
-    consensus_ok = total_votes >= 4 and abs(votes_long - votes_short) >= 3
-    if total_votes > 0 and not consensus_ok:
-        reasons.append(
-            f"veto: weak consensus (votes long={votes_long} short={votes_short}, "
-            f"can >=4 module co y kien VA chenh lech >=3)")
+    if abs(votes_long - votes_short) <= 1 and (votes_long + votes_short) > 0:
+        reasons.append("veto: mixed (vote long/short chenh <=1)")
         return {
             "score": 0.0, "direction": "neutral", "confidence": 0.0,
-            "reasons": reasons, "veto": True, "veto_reason": "weak consensus",
+            "reasons": reasons, "veto": True, "veto_reason": "mixed votes",
             "module_scores": module_scores,
         }
 
@@ -543,7 +339,11 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
         total *= 0.75
         reasons.append(f"spoof_score {spoof_score:.2f} > 0.6 -> x0.75")
 
-    magnitude = abs(total) / max_possible if max_possible else 0.0
+    raw_magnitude = abs(total) / active_weight_sum if active_weight_sum else 0.0
+    participation_ratio = active_weight_sum / max_possible if max_possible else 0.0
+    participation_factor = math.sqrt(max(participation_ratio, 0.0))
+    magnitude = raw_magnitude * participation_factor
+
     score = max(0.0, min(100.0, magnitude * 100.0))
     confidence = magnitude
 
@@ -566,12 +366,11 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
 
 
 def suggested_sl_tp(entry: float, direction: str, atr15m: float) -> Tuple[float, float]:
-    """SL/TP tu ATR15m. Giu nguyen cong thuc goc tren GitHub: SL = 0.8xATR, TP = 1.5xATR (R:R~1.9).
-    README ghi 1.2x/2.4x nhung README chua duoc cap nhat dung; khong doi theo README."""
+    """SL/TP tu ATR15m: SL = 1.2*ATR, TP = 2.4*ATR (R:R = 2.0)."""
     if direction == "long":
-        return entry - 0.8 * atr15m, entry + 1.5 * atr15m
+        return entry - 1.2 * atr15m, entry + 2.4 * atr15m
     if direction == "short":
-        return entry + 0.8 * atr15m, entry - 1.5 * atr15m
+        return entry + 1.2 * atr15m, entry - 2.4 * atr15m
     return entry, entry
 
 
