@@ -2,6 +2,7 @@
 config.py
 
 Cau hinh trung tam cho bot_mm_fund. Doc .env, doc weights.json, tien ich ghi JSONL.
+
 Khong dat lenh. Chi bao tin hieu.
 """
 from __future__ import annotations
@@ -73,10 +74,14 @@ class AppConfig:
     # --- Full-model-for-all-pairs ---
     full_data_all: bool = field(default_factory=lambda: _get_bool("FULL_DATA_ALL", True))
     cross_exchange_all: bool = field(default_factory=lambda: _get_bool("CROSS_EXCHANGE_ALL", False))
+    # FIX: field nay truoc day bi thieu -> AttributeError 'AppConfig' object has no
+    # attribute 'cross_exchange_timeout' moi vong quet cho CORE_SYMBOLS (BTC/ETH/SOL).
+    # Timeout (giay) cho tung request cross-exchange (OKX/Bybit/BingX/KuCoin/Bitget/MEXC).
+    cross_exchange_timeout: float = field(default_factory=lambda: _get_float("CROSS_EXCHANGE_TIMEOUT", 3.0))
     ws_cover_all: bool = field(default_factory=lambda: _get_bool("WS_COVER_ALL", True))
     ws_chunk_size: int = field(default_factory=lambda: _get_int("WS_CHUNK_SIZE", 40))
-
     max_workers: int = field(default_factory=lambda: _get_int("MAX_WORKERS", 12))
+
     # Ngan sach weight/phut, de duoi gioi han that cua Binance Futures (2400/phut/IP)
     weight_budget_per_min: int = field(default_factory=lambda: _get_int("WEIGHT_BUDGET_PER_MIN", 2000))
 
@@ -99,10 +104,6 @@ class AppConfig:
 
     log_path: str = field(default_factory=lambda: os.getenv("LOG_PATH", "logs/signals.jsonl"))
     feature_log_path: str = field(default_factory=lambda: os.getenv("FEATURE_LOG_PATH", "logs/features.jsonl"))
-    # Fix lo hong #3 (mat active_signals/cooldowns khi restart/deploy): file
-    # JSON de ghi lai state sau moi vong quet, doc lai luc khoi dong.
-    active_signals_state_path: str = field(default_factory=lambda: os.getenv(
-        "ACTIVE_SIGNALS_STATE_PATH", "logs/active_signals_state.json"))
 
     depth_levels: int = field(default_factory=lambda: _get_int("DEPTH_LEVELS", 20))
     tape_window_seconds: int = field(default_factory=lambda: _get_int("TAPE_WINDOW_SECONDS", 14400))
@@ -111,38 +112,6 @@ class AppConfig:
     book_persist_ms: int = field(default_factory=lambda: _get_int("BOOK_PERSIST_MS", 1000))
     profile_tick_buckets: int = field(default_factory=lambda: _get_int("PROFILE_TICK_BUCKETS", 40))
     signal_ttl_seconds: int = field(default_factory=lambda: _get_int("SIGNAL_TTL_SECONDS", 2400))
-    # Chong "loang" tin hieu: neu 1 symbol dang co tin hieu CUNG CHIEU (long/long
-    # hoac short/short) con active (chua cham SL/TP3/het TTL), bo qua alert moi
-    # cung chieu cho symbol do - tranh spam nhieu keo trung nhau tren cung 1 coin.
-    # Tin hieu NGUOC CHIEU (vd dang long active ma co short moi) van duoc bao
-    # binh thuong vi la thong tin dao the co gia tri rieng.
-    suppress_duplicate_direction_signal: bool = field(
-        default_factory=lambda: _get_bool("SUPPRESS_DUPLICATE_DIRECTION_SIGNAL", True))
-    # Canh bao tham khao (KHONG tu dong dong keo): moi vong quet, re-scan lai
-    # cac symbol dang co tin hieu active (dung ngay ket qua da tinh trong vong
-    # quet nay, khong ton them API call). Neu quet lai bi veto / mat huong ro
-    # rang / dao chieu so voi luc vao -> gui 1 canh bao (chi 1 lan khi trang
-    # thai thay doi, khong spam lai moi vong). Bot van theo doi SL/TP binh
-    # thuong, nguoi dung tu quyet dinh giu hay dong keo.
-    enable_signal_health_warning: bool = field(
-        default_factory=lambda: _get_bool("ENABLE_SIGNAL_HEALTH_WARNING", True))
-
-    # --- SL/TP da tang (theo yeu cau: TP khong qua ngan, SL vua phai theo regime) ---
-    # SL = entry -+ sl_mult * ATR15m. sl_mult chon theo regime (xem signals.suggested_sl_tp):
-    #   trending (mac dinh)      -> SL_ATR_BASE_MULT
-    #   high_volatility          -> SL_ATR_HIGH_VOL_MULT (rong hon, tranh bi quet boi bien dong lon)
-    #   accumulation             -> SL_ATR_ACCUMULATION_MULT (hep hon, bien do gia nho)
-    sl_atr_base_mult: float = field(default_factory=lambda: _get_float("SL_ATR_BASE_MULT", 1.2))
-    sl_atr_high_vol_mult: float = field(default_factory=lambda: _get_float("SL_ATR_HIGH_VOL_MULT", 1.6))
-    sl_atr_accumulation_mult: float = field(default_factory=lambda: _get_float("SL_ATR_ACCUMULATION_MULT", 1.0))
-    # Neu POC nam giua entry va SL ly thuyet (SL dang cat ngang vung volume cao),
-    # day SL ra ngoai POC them mot chut (tinh theo boi so ATR) de tranh bi quet
-    # dung tai vung thanh khoan day.
-    sl_poc_buffer_atr: float = field(default_factory=lambda: _get_float("SL_POC_BUFFER_ATR", 0.15))
-    # TP = entry +- tp_mult * R, R = |entry - SL| (1 don vi rui ro).
-    tp1_r_mult: float = field(default_factory=lambda: _get_float("TP1_R_MULT", 1.2))
-    tp2_r_mult: float = field(default_factory=lambda: _get_float("TP2_R_MULT", 2.4))
-    tp3_r_mult: float = field(default_factory=lambda: _get_float("TP3_R_MULT", 4.0))
 
     def resolve_path(self, rel: str) -> Path:
         p = Path(rel)
