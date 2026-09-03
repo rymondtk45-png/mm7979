@@ -5,7 +5,6 @@ Module score + luat HTF veto + composite + ranking.
 Moi module tra ve signed float trong [-1, 1]: duong = nghieng long, am = nghieng short,
 do lon = do tin cay module do. Composite = sum(module_score * weight), sau do chuan hoa 0-100.
 """
-
 from __future__ import annotations
 
 from typing import Dict, List, Tuple
@@ -48,7 +47,6 @@ def classify_entry(f: dict, result: dict, weights: Dict[str, float]) -> dict:
 
     sign = 1.0 if direction == "long" else -1.0
     module_scores = result.get("module_scores", {})
-
     momentum_contrib = 0.0
     structure_contrib = 0.0
     for name, raw in module_scores.items():
@@ -263,33 +261,6 @@ MODULE_FUNCS = {
 }
 
 
-def _run_modules(f: dict, weights: Dict[str, float], cfg: AppConfig):
-    """Helper dung chung: chay toan bo module active, tra ve
-    (module_scores, total, max_possible, votes_long, votes_short)."""
-    active_modules = LEGACY_MODULES if not cfg.enable_market_intel_scoring else list(weights.keys())
-    module_scores: Dict[str, float] = {}
-    total = 0.0
-    max_possible = 0.0
-    votes_long = 0
-    votes_short = 0
-    for name in active_modules:
-        if name not in weights:
-            continue
-        func = MODULE_FUNCS.get(name)
-        if not func:
-            continue
-        raw = func(f)
-        module_scores[name] = raw
-        w = weights[name]
-        total += raw * w
-        max_possible += w
-        if raw > 0.05:
-            votes_long += 1
-        elif raw < -0.05:
-            votes_short += 1
-    return module_scores, total, max_possible, votes_long, votes_short
-
-
 def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dict:
     """
     Tra ve dict: score(0-100), direction(long/short/neutral), confidence(0-1),
@@ -307,17 +278,82 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
             "module_scores": {},
         }
 
-    module_scores, total, max_possible, votes_long, votes_short = _run_modules(f, weights, cfg)
+    active_modules = LEGACY_MODULES if not cfg.enable_market_intel_scoring else list(weights.keys())
 
-    if abs(votes_long - votes_short) <= 1 and (votes_long + votes_short) > 0:
-        reasons.append("veto: mixed (vote long/short chenh <=1)")
+    module_scores: Dict[str, float] = {}
+    total = 0.0
+    votes_long = 0
+    votes_short = 0
+
+    for name in active_modules:
+        if name not in weights:
+            continue
+        func = MODULE_FUNCS.get(name)
+        if not func:
+            continue
+        raw = func(f)
+        module_scores[name] = raw
+        w = weights[name]
+        total += raw * w
+        if raw > 0.05:
+            votes_long += 1
+        elif raw < -0.05:
+            votes_short += 1
+
+    # FIX: README muc 6.5 mo ta consensus DA SIET LAI thanh "can it nhat 4
+    # module co y kien VA chenh lech phieu long/short >= 3", nhung code cu
+    # o day chi kiem tra "chenh lech <= 1 thi veto" (tuc chi can chenh lech
+    # >= 2, KHONG co dieu kien so luong module toi thieu) - chinh la ban
+    # "cu" ma README noi da bo di. Vi vay tin hieu chi co 2 module dong y
+    # (vd 2 vote long, 0 vote short) van lot qua, gay nhieu tin hieu "mong
+    # manh" tren symbol thanh khoan mong / du lieu it. Sua lai dung theo
+    # tai lieu: khong noi long gi them, chi ap dung dung nhu tac gia da
+    # dinh - vi vay day la fix AN TOAN, chi siet chat hon, khong lam giam
+    # chat luong tin hieu da qua loc.
+    total_votes = votes_long + votes_short
+    vote_diff = abs(votes_long - votes_short)
+    if total_votes < 4 or vote_diff < 3:
+        reasons.append(
+            f"veto: weak consensus (modules co y kien={total_votes}, "
+            f"chenh lech phieu={vote_diff}, can >=4 module VA chenh lech >=3)")
         return {
             "score": 0.0, "direction": "neutral", "confidence": 0.0,
-            "reasons": reasons, "veto": True, "veto_reason": "mixed votes",
+            "reasons": reasons, "veto": True, "veto_reason": "weak consensus",
             "module_scores": module_scores,
         }
 
     direction = "long" if total > 0 else ("short" if total < 0 else "neutral")
+
+    # FIX: dam bao "dong thuan" la bang chung DOC LAP, khong phai 1 loai
+    # tin hieu bi dem lap lai duoi nhieu ten module. MOMENTUM_MODULES (4
+    # module) deu do cung 1 hien tuong - ap luc mua/ban chu dong ngay luc
+    # nay - duoi cac goc nhin khac nhau, nen tuong quan rat cao. Neu ca 4
+    # cung len tieng, gate cu (>=4 module, chenh lech >=3) se coi day la
+    # "dong thuan manh" trong khi thuc chat chi la 1 nguon bang chung. Yeu
+    # cau cac module dang vote CUNG HUONG voi tin hieu cuoi cung phai trai
+    # it nhat 2/3 nhom ban chat (MOMENTUM / STRUCTURE / MEAN-REVERSION).
+    dir_sign = 1.0 if direction == "long" else (-1.0 if direction == "short" else 0.0)
+    categories_present = set()
+    for name, raw in module_scores.items():
+        if raw * dir_sign <= 0.05:
+            continue
+        if name in MOMENTUM_MODULES:
+            categories_present.add("momentum")
+        elif name in STRUCTURE_MODULES:
+            categories_present.add("structure")
+        elif name in MEANREV_MODULES:
+            categories_present.add("meanrev")
+
+    if len(categories_present) < 2:
+        cats_str = ",".join(sorted(categories_present)) if categories_present else "none"
+        reasons.append(
+            f"veto: dong thuan chi tap trung 1 nhom ban chat ({cats_str}) "
+            f"- can bang chung tu >=2/3 nhom (momentum/structure/mean-reversion)")
+        return {
+            "score": 0.0, "direction": "neutral", "confidence": 0.0,
+            "reasons": reasons, "veto": True, "veto_reason": "low evidence diversity",
+            "module_scores": module_scores,
+        }
 
     if f.get("bias_4h") != "neutral" and f.get("bias_4h") == direction:
         total *= 1.15
@@ -328,7 +364,22 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
         total *= 0.75
         reasons.append(f"spoof_score {spoof_score:.2f} > 0.6 -> x0.75")
 
-    magnitude = abs(total) / max_possible if max_possible else 0.0
+    # FIX: chuan hoa theo tong trong so cua CAC MODULE DANG THUC SU CO Y
+    # KIEN (|raw|>0.05, dung ngung "vote" da dung o tren), khong phai tong
+    # trong so CA 12 module (max_possible cu, hang so = 9.6). Nhieu module
+    # (funding_extreme, liquidity_sweep, absorption, cross_exchange_divergence)
+    # co dieu kien - phan lon thoi gian tra ve dung 0 vi thi truong khong
+    # roi vao trang thai cuc doan tuong ung, KHONG phai vi tin hieu yeu. Chia
+    # cho tong weight ca nhung module dang im lang do ban chat la sai ve mat
+    # thong ke - phat oan tin hieu that su manh giua cac module DANG hoat
+    # dong. active_weight phan anh dung "% hoi tu toi da co the dat duoc,
+    # TRONG SO CAC KENH BANG CHUNG DANG LEN TIENG". Khong lam long bat ky
+    # dieu kien loc chat luong nao o tren (gate >=4 module, chenh lech >=3,
+    # da dang >=2/3 nhom van nguyen ven).
+    active_weight = sum(
+        weights[name] for name, raw in module_scores.items() if abs(raw) > 0.05
+    )
+    magnitude = abs(total) / active_weight if active_weight else 0.0
     score = max(0.0, min(100.0, magnitude * 100.0))
     confidence = magnitude
 
@@ -347,108 +398,6 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
     return {
         "score": score, "direction": direction, "confidence": confidence,
         "reasons": reasons, "veto": False, "veto_reason": "", "module_scores": module_scores,
-    }
-
-
-def compute_composite_scan(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dict:
-    """
-    Bien the CHI DUNG CHO LENH /scan (khong dung trong vong lap alert chinh
-    run_once/compute_composite): bo qua veto HTF va veto "mixed votes" de
-    /scan LUON tra ve mot huong entry co the xem, kem canh bao ro rang la
-    huong nay chua qua het lop bao ve cua he thong.
-
-    Logic:
-    1) Van chay htf_check() nhu binh thuong nhung CHI DE GHI LAI ly do
-       (htf_bypassed=True neu llo ra bi veto o composite chinh).
-    2) Tinh 12 module + tong co trong so nhu compute_composite. Neu tong
-       ro huong (>0 hoac <0) thi dung huong do. Neu tong = 0 (thuong xay
-       ra khi HTF veto lam bias 15m/1h/4h trung hoa lan nhau trong cac
-       module dua tren bias) hoac neu bi veto "mixed votes", KHONG con
-       tra ve neutral nua ma chon module co |raw*weight| lon nhat lam
-       huong de xuat (forced_by_strength=True) - dung "module manh nhat"
-       theo yeu cau nguoi dung.
-    3) Diem so (score/confidence) van tinh trung thuc: neu la huong bi
-       "ep" theo module manh nhat (khong phai dong thuan that su) thi
-       nhan them he so giam (x0.6) de phan biet voi tin hieu dong thuan
-       day du - tranh nguoi dung hieu lam day la tin hieu "chat luong
-       cao" ngang voi alert tu dong.
-
-    Tra ve dict giong compute_composite + them:
-      htf_bypassed (bool): True neu htf_check() dang veto (conflict/align).
-      htf_reason (str): ly do tu htf_check(), du co bypass hay khong.
-      mixed_votes (bool): True neu vote long/short dang mong manh (chenh <=1).
-      forced_by_strength (bool): True neu huong duoc chon tu module manh
-        nhat vi tong co trong so = 0 (khong the suy huong tu tong).
-    """
-    reasons: List[str] = []
-
-    allowed, htf_reason = htf_check(f.get("bias_15m", "neutral"), f.get("bias_1h", "neutral"),
-                                     f.get("bias_4h", "neutral"), cfg)
-    htf_bypassed = not allowed
-    reasons.append(htf_reason if allowed else f"{htf_reason} (BO QUA rieng cho /scan)")
-
-    module_scores, total, max_possible, votes_long, votes_short = _run_modules(f, weights, cfg)
-
-    mixed_votes = abs(votes_long - votes_short) <= 1 and (votes_long + votes_short) > 0
-    if mixed_votes:
-        reasons.append("canh bao: mixed (vote long/short chenh <=1) - /scan van hien theo module manh nhat")
-
-    if total > 0:
-        direction = "long"
-    elif total < 0:
-        direction = "short"
-    else:
-        direction = "neutral"
-
-    strongest_name = None
-    strongest_contrib = 0.0
-    for name, raw in module_scores.items():
-        contrib = raw * weights.get(name, 0.0)
-        if abs(contrib) > abs(strongest_contrib):
-            strongest_name, strongest_contrib = name, contrib
-
-    forced_by_strength = False
-    if direction == "neutral" and strongest_name and abs(strongest_contrib) > 1e-9:
-        direction = "long" if strongest_contrib > 0 else "short"
-        forced_by_strength = True
-        reasons.append(
-            f"khong co huong tong ro rang, dung module manh nhat '{strongest_name}' "
-            f"({strongest_contrib:+.3f}) -> nghieng {direction} (chi ap dung cho /scan)"
-        )
-
-    if direction != "neutral":
-        if f.get("bias_4h") != "neutral" and f.get("bias_4h") == direction:
-            total *= 1.15
-            reasons.append("4h aligned x1.15")
-
-        spoof_score = f.get("spoof_score", 0.0)
-        if spoof_score > 0.6:
-            total *= 0.75
-            reasons.append(f"spoof_score {spoof_score:.2f} > 0.6 -> x0.75")
-
-    magnitude = abs(total) / max_possible if max_possible else 0.0
-    if forced_by_strength and max_possible:
-        # tong bi trung hoa ve 0 nhung van co 1 module manh -> dung do lon
-        # cua module do lam proxy, giam bot (x0.6) vi day la tin hieu "mong"
-        # hon dong thuan that su (chi 1 module, khong phai tong hop nhieu module).
-        magnitude = min(abs(strongest_contrib) / max_possible, 1.0) * 0.6
-
-    score = max(0.0, min(100.0, magnitude * 100.0))
-    confidence = magnitude
-
-    if direction == "neutral":
-        reasons.append("khong co huong ro rang (ke ca module manh nhat cung = 0)")
-
-    top_modules = sorted(module_scores.items(), key=lambda kv: abs(kv[1]), reverse=True)[:4]
-    for name, val in top_modules:
-        if abs(val) > 0.05:
-            reasons.append(f"{name}: {'long' if val > 0 else 'short'} ({val:+.2f})")
-
-    return {
-        "score": score, "direction": direction, "confidence": confidence,
-        "reasons": reasons, "veto": False, "veto_reason": "", "module_scores": module_scores,
-        "htf_bypassed": htf_bypassed, "htf_reason": htf_reason,
-        "mixed_votes": mixed_votes, "forced_by_strength": forced_by_strength,
     }
 
 

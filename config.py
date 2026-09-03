@@ -78,6 +78,11 @@ class AppConfig:
     # xu ly va rot khoi ket qua scoring. Timeout (giay) cho moi request gia
     # tham chieu tu 1 san doi tac trong buoc cross-exchange divergence.
     cross_exchange_timeout: float = field(default_factory=lambda: _get_float("CROSS_EXCHANGE_TIMEOUT", 3.0))
+    # FIX: 2 field nay cung bi thieu -> se AttributeError tuong tu ngay khi
+    # nhanh cross-exchange trong data.py duoc goi toi (workers song song +
+    # thoi gian cache gia tham chieu).
+    cross_exchange_workers: int = field(default_factory=lambda: _get_int("CROSS_EXCHANGE_WORKERS", 4))
+    cross_exchange_cache_seconds: int = field(default_factory=lambda: _get_int("CROSS_EXCHANGE_CACHE_SECONDS", 30))
     ws_cover_all: bool = field(default_factory=lambda: _get_bool("WS_COVER_ALL", True))
     ws_chunk_size: int = field(default_factory=lambda: _get_int("WS_CHUNK_SIZE", 40))
     max_workers: int = field(default_factory=lambda: _get_int("MAX_WORKERS", 12))
@@ -112,6 +117,12 @@ class AppConfig:
     book_persist_ms: int = field(default_factory=lambda: _get_int("BOOK_PERSIST_MS", 1000))
     profile_tick_buckets: int = field(default_factory=lambda: _get_int("PROFILE_TICK_BUCKETS", 40))
     signal_ttl_seconds: int = field(default_factory=lambda: _get_int("SIGNAL_TTL_SECONDS", 2400))
+
+    # --- /scan <symbol> theo doi thu cong ---
+    # FIX: 2 field nay bi thieu -> AttributeError 'scan_max_subscriptions' khi
+    # goi lenh Telegram /scan (xem app.py handle_scan_command / _check_scan_updates).
+    scan_max_subscriptions: int = field(default_factory=lambda: _get_int("SCAN_MAX_SUBSCRIPTIONS", 10))
+    scan_update_seconds: int = field(default_factory=lambda: _get_int("SCAN_UPDATE_SECONDS", 60))
 
     def resolve_path(self, rel: str) -> Path:
         p = Path(rel)
