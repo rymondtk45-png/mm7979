@@ -1,45 +1,30 @@
 """
 app.py
-
-TelegramBot (gui alert + poll lenh /coinstrong, /scan, bo <symbol>) va
-SignalEngine (vong lap chinh).
+TelegramBot (gui alert + poll lenh /coinstrong) va SignalEngine (vong lap chinh).
 Chi bao tin hieu qua Telegram. Khong dat lenh tren san.
 """
-
 from __future__ import annotations
 
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Callable, Dict, List, Optional
+from typing import Dict, List, Optional
 
 import requests
 
 from config import AppConfig, append_jsonl, get_logger, load_weights
-from data import MarketContext, UniverseManager, build_features, init_rate_limiter
-from signals import (
-    classify_entry,
-    compute_composite,
-    compute_composite_scan,
-    rank_top,
-    suggested_sl_tp,
-)
+from data import MarketContext, UniverseManager, build_features, fetch_last_price, init_rate_limiter
+from signals import classify_entry, compute_composite, rank_top, suggested_sl_tp
 
 log = get_logger("app")
 
 
 class TelegramBot:
-    def __init__(self, cfg: AppConfig, universe: UniverseManager,
-                 on_scan: Optional[Callable[[str, str], None]] = None,
-                 on_unscan: Optional[Callable[[str, str], None]] = None):
+    def __init__(self, cfg: AppConfig, universe: UniverseManager):
         self.cfg = cfg
         self.universe = universe
         self._offset: Optional[int] = None
         self._stop = threading.Event()
-        # Callback rieng cho lenh /scan va bo <symbol> - gan tu SignalEngine
-        # de TelegramBot khong can biet ve build_features/compute_composite_scan.
-        self.on_scan = on_scan
-        self.on_unscan = on_unscan
 
     def _api(self, method: str) -> str:
         return f"https://api.telegram.org/bot{self.cfg.telegram_bot_token}/{method}"
@@ -74,9 +59,9 @@ class TelegramBot:
         ok = self._verify_bot_token()
         if not ok:
             log.error("TELEGRAM_BOT_TOKEN khong hop le (Telegram tra ve loi khi goi getMe). "
-                      "Kiem tra lai token.")
+                       "Kiem tra lai token.")
             return
-        log.info("Da ket noi Telegram OK, bat dau lang nghe lenh /coinstrong, /scan, bo ...")
+        log.info("Da ket noi Telegram OK, bat dau lang nghe lenh /coinstrong ...")
         while not self._stop.is_set():
             try:
                 resp = requests.get(self._api("getUpdates"), params={
@@ -94,25 +79,12 @@ class TelegramBot:
                     text = text_raw.strip().lower()
                     chat_id = str(msg.get("chat", {}).get("id", ""))
                     log.info("Nhan tin nhan Telegram tu chat_id=%s: %r", chat_id, text_raw)
-
                     if text.startswith("/coinstrong"):
                         self._handle_coinstrong(text)
-                    elif text.startswith("/scan"):
-                        if self.on_scan:
-                            self.on_scan(text_raw.strip(), chat_id)
-                        else:
-                            self.send_message("Lenh /scan chua duoc cau hinh.")
-                    elif text.startswith("bo ") or text.startswith("bỏ "):
-                        if self.on_unscan:
-                            self.on_unscan(text_raw.strip(), chat_id)
-                        else:
-                            self.send_message('Lenh "bo <symbol>" chua duoc cau hinh.')
                     elif text.startswith("/start"):
                         self.send_message(
                             "Bot bao tin hieu MM/quy da san sang.\n"
-                            "Dung /coinstrong on|off|status de dieu khien vu tru quet.\n"
-                            "Dung /scan <symbol> de theo doi rieng 1 coin (cap nhat moi "
-                            f"{self.cfg.scan_update_seconds}s), va 'bo <symbol>' de dung.")
+                            "Dung /coinstrong on|off|status de dieu khien vu tru quet.")
             except Exception as e:  # noqa: BLE001
                 log.warning("Telegram poll loi: %s", e)
                 time.sleep(3)
@@ -176,70 +148,15 @@ def format_alert(f: dict, result: dict, entry_info: dict, sl: float, tp: float) 
     )
 
 
-def format_scan_alert(symbol: str, f: dict, result: dict, entry_info: dict, sl: float, tp: float,
-                       is_first: bool, cfg: AppConfig) -> str:
-    """
-    Format rieng cho lenh /scan. Khac format_alert() o cho: /scan dung
-    compute_composite_scan() (bo qua veto HTF/mixed-vote), nen LUON co the
-    hien mot huong + entry/SL/TP thay vi NEUTRAL/score=0 khi bi veto - kem
-    canh bao ro rang khi huong do dang duoc "ep" tu module manh nhat thay vi
-    dong thuan day du, de nguoi dung tu can nhac rui ro.
-    """
-    tag = "(snapshot dau tien)" if is_first else "(cap nhat)"
-    direction = result["direction"].upper()
-    vp = f.get("volume_profile", {})
-    lsr = f.get("long_short_ratio")
-    lsr_str = f"{lsr:.2f}" if lsr is not None else "n/a"
-
-    lines = [
-        f"<b>[SCAN] {symbol}</b> {tag}",
-        f"Huong: <b>{direction}</b> | Score: {result['score']:.1f} "
-        f"(threshold he thong: {cfg.threshold:.1f}) | Confidence: {result['confidence']:.2f}",
-        f"Regime: {f.get('regime', '')} | Gia hien tai: {f.get('last_price', 0):.6g}",
-        f"HTF 15m/1h/4h: {f.get('bias_15m')}/{f.get('bias_1h')}/{f.get('bias_4h')}",
-        f"POC15m: {vp.get('poc', 0):.6g} | CVD5m: {f.get('cvd_5m', 0):.2f} | "
-        f"spoof: {f.get('spoof_score', 0):.2f}",
-        f"Long/Short ratio: {lsr_str}",
-    ]
-
-    if result.get("htf_bypassed"):
-        lines.append(f"- {result.get('htf_reason', '')} (rieng /scan: BO QUA veto nay)")
-    if result.get("mixed_votes"):
-        lines.append("- canh bao: dong thuan module con mong (vote long/short chenh <=1)")
-
-    if result["direction"] == "neutral":
-        lines.append("De xuat: chua module nao du du lieu de nghieng huong - chua co gi de GONG/CAT.")
-    else:
-        entry_type = entry_info["entry_type"]
-        entry_price = entry_info["entry_price"]
-        entry_line = (
-            f"Entry: {entry_price:.6g} MARKET (vao ngay)" if entry_type == "MARKET"
-            else f"Entry: {entry_price:.6g} LIMIT (cho khop, gia hien tai {f.get('last_price', 0):.6g})"
-        )
-        risk_note = ""
-        if result.get("htf_bypassed") or result.get("forced_by_strength"):
-            risk_note = (" [luu y: huong nay dang duoc suy tu module manh nhat / bo qua veto HTF "
-                         "- RUI RO CAO HON tin hieu alert tu dong, can size nho hon]")
-        lines.append(f"De xuat: {entry_line}{risk_note}")
-        lines.append(f"SL: {sl:.6g} | TP: {tp:.6g} | Ly do: {entry_info['reason']}")
-
-    lines.append(f'(Nhan "bo {symbol}" de dung cap nhat bat cu luc nao)')
-    return "\n".join(lines)
-
-
 class SignalEngine:
     def __init__(self, cfg: AppConfig):
         self.cfg = cfg
         self.weights = load_weights()
         self.universe = UniverseManager(cfg)
         self.ctx = MarketContext(cfg)
-        self.bot = TelegramBot(cfg, self.universe,
-                                on_scan=self.handle_scan_command,
-                                on_unscan=self.handle_unscan_command)
+        self.bot = TelegramBot(cfg, self.universe)
         self.cooldowns: Dict[str, float] = {}
         self.active_signals: Dict[str, dict] = {}
-        # symbol -> {"chat_id": str, "next_update": float}
-        self.scan_subscriptions: Dict[str, dict] = {}
         self._state_lock = threading.Lock()
         self._stop = threading.Event()
         init_rate_limiter(cfg)
@@ -261,125 +178,6 @@ class SignalEngine:
         if self.ctx.stream:
             self.ctx.stream.stop()
 
-    # ----------------------------------------------------------------
-    # Lenh /scan <symbol> va "bo <symbol>"
-    # ----------------------------------------------------------------
-    def _resolve_symbol(self, query: str, candidates: Optional[List[str]] = None) -> Optional[str]:
-        """Chuan hoa input nguoi dung (vd 'Sushi', 'zkp', 'ZKPUSDT') thanh dung
-        symbol Binance Futures. candidates=None -> tim trong toan bo vu tru;
-        candidates=list -> chi tim trong danh sach do (dung khi unsub, uu tien
-        khop voi cac symbol dang duoc theo doi)."""
-        raw = "".join(ch for ch in query.strip().upper() if ch.isalnum())
-        if not raw:
-            return None
-        pool = candidates if candidates is not None else list(self.universe.symbols_info.keys())
-        if not pool:
-            return None
-        if raw in pool:
-            return raw
-        quote = self.cfg.quote_asset
-        if not raw.endswith(quote) and (raw + quote) in pool:
-            return raw + quote
-        # fuzzy: symbol bat dau bang raw (vd 'SUSHI' -> 'SUSHIUSDT'), chon ngan nhat
-        starts = sorted((s for s in pool if s.startswith(raw)), key=len)
-        if starts:
-            return starts[0]
-        # fuzzy nguoc: raw chua ten symbol (vd query = 'ZKPUSDT' con pool chi co base 'ZKP')
-        contains = sorted((s for s in pool if raw.startswith(s)), key=len, reverse=True)
-        if contains:
-            return contains[0]
-        return None
-
-    def handle_scan_command(self, text_raw: str, chat_id: str) -> None:
-        parts = text_raw.split()
-        if len(parts) < 2:
-            self.bot.send_message('Cu phap: /scan <symbol>  (vi du: /scan ZKPUSDT hoac /scan Sushi)')
-            return
-        query = parts[1]
-        if not self.universe.symbols_info:
-            self.universe.refresh(force=True)
-        resolved = self._resolve_symbol(query)
-        if not resolved:
-            self.bot.send_message(f'Khong tim thay symbol khop voi "{query}" tren Binance Futures.')
-            return
-        with self._state_lock:
-            already = resolved in self.scan_subscriptions
-            over_limit = (not already) and len(self.scan_subscriptions) >= self.cfg.scan_max_subscriptions
-        if over_limit:
-            self.bot.send_message(
-                f"Da dat gioi han {self.cfg.scan_max_subscriptions} symbol dang /scan cung luc. "
-                f'Dung "bo <symbol>" de bo bot truoc khi them symbol moi.')
-            return
-        if already:
-            self.bot.send_message(f"{resolved} dang duoc theo doi roi (cap nhat moi "
-                                   f"{self.cfg.scan_update_seconds}s).")
-            return
-        # Chay snapshot dau tien trong thread rieng de khong chan vong poll Telegram.
-        threading.Thread(target=self._scan_snapshot_and_register,
-                          args=(resolved, chat_id, True), daemon=True).start()
-
-    def handle_unscan_command(self, text_raw: str, chat_id: str) -> None:
-        parts = text_raw.split()
-        if len(parts) < 2:
-            self.bot.send_message('Cu phap: bo <symbol>  (vi du: bo ZKPUSDT)')
-            return
-        query = parts[1]
-        with self._state_lock:
-            current = list(self.scan_subscriptions.keys())
-        resolved = self._resolve_symbol(query, candidates=current) or self._resolve_symbol(query)
-        with self._state_lock:
-            removed = resolved is not None and self.scan_subscriptions.pop(resolved, None) is not None
-        if removed:
-            self.bot.send_message(f"Da dung theo doi {resolved}.")
-        else:
-            self.bot.send_message(f'Khong tim thay "{query}" trong danh sach dang /scan.')
-
-    def _scan_snapshot_and_register(self, symbol: str, chat_id: str, is_first: bool) -> None:
-        """Build features + compute_composite_scan() (bo qua veto HTF, lay
-        module manh nhat khi khong co huong tong ro rang) cho 1 symbol, gui
-        ket qua qua Telegram. Neu is_first=True, chi dang ky theo doi dinh ky
-        SAU KHI gui snapshot dau tien thanh cong."""
-        try:
-            is_core = symbol in self.cfg.core_symbols
-            is_ws = symbol in set(self.universe.ws_symbols())
-            features = build_features(symbol, self.cfg, self.ctx, is_core, is_ws)
-            result = compute_composite_scan(features, self.weights, self.cfg)
-            entry_info = classify_entry(features, result, self.weights)
-            sl, tp = suggested_sl_tp(entry_info["entry_price"], result["direction"], features["atr15m"])
-            msg = format_scan_alert(symbol, features, result, entry_info, sl, tp, is_first, self.cfg)
-            self.bot.send_message(msg)
-            append_jsonl(self.cfg.resolve_path(self.cfg.log_path), {
-                "ts": time.time(), "symbol": symbol, "event": "scan_snapshot",
-                "direction": result["direction"], "score": result["score"],
-                "htf_bypassed": result.get("htf_bypassed", False),
-                "forced_by_strength": result.get("forced_by_strength", False),
-            })
-        except Exception as e:  # noqa: BLE001
-            log.warning("Loi /scan cho %s: %s", symbol, e)
-            if is_first:
-                self.bot.send_message(f"Loi khi lay du lieu cho {symbol}, thu lai sau.")
-            return
-        if is_first:
-            with self._state_lock:
-                self.scan_subscriptions[symbol] = {
-                    "chat_id": chat_id, "next_update": time.time() + self.cfg.scan_update_seconds,
-                }
-            log.info("Bat dau /scan theo doi %s (cap nhat moi %ss)", symbol, self.cfg.scan_update_seconds)
-
-    def _check_scan_updates(self) -> None:
-        now = time.time()
-        with self._state_lock:
-            due = [sym for sym, meta in self.scan_subscriptions.items() if now >= meta["next_update"]]
-            for sym in due:
-                self.scan_subscriptions[sym]["next_update"] = now + self.cfg.scan_update_seconds
-        for sym in due:
-            chat_id = self.scan_subscriptions.get(sym, {}).get("chat_id", "")
-            threading.Thread(target=self._scan_snapshot_and_register,
-                              args=(sym, chat_id, False), daemon=True).start()
-
-    # ----------------------------------------------------------------
-    # Vong lap alert chinh (khong doi so voi ban goc)
-    # ----------------------------------------------------------------
     def _check_hits_and_expiry(self, current_prices: Dict[str, float]) -> None:
         now = time.time()
         expired = []
@@ -403,18 +201,12 @@ class SignalEngine:
                     })
                 elif now - sig["created_at"] > self.cfg.signal_ttl_seconds:
                     # Limit cho qua lau khong khop -> huy, khong tinh la mot lenh da vao.
-                    # FIX: truoc day chi ghi log jsonl, nguoi dung khong biet kèo da
-                    # het han ma khong bao gio khop -> gio bao qua Telegram.
-                    self.bot.send_message(
-                        f"<b>{sym}</b> {direction.upper()} LIMIT <b>HET HAN</b> sau "
-                        f"{self.cfg.signal_ttl_seconds}s, chua khop tai {sig['entry_price']:.6g} "
-                        f"(gia hien tai {price:.6g}) - bo qua kèo nay.")
                     append_jsonl(self.cfg.resolve_path(self.cfg.log_path), {
                         "ts": now, "symbol": sym, "event": "limit_expired_unfilled",
                     })
                     expired.append(sym)
-                if not sig["filled"]:
-                    continue
+            if not sig["filled"]:
+                continue
             hit = None
             if direction == "long":
                 if price <= sig["sl"]:
@@ -434,92 +226,37 @@ class SignalEngine:
                 })
                 expired.append(sym)
             elif now - sig["created_at"] > self.cfg.signal_ttl_seconds:
-                # FIX: truoc day het TTL ma chua cham SL/TP thi bi am tham xoa
-                # khoi active_signals, khong bao gi ca -> nguoi dung tuong kèo
-                # con "song". Gio bao ro la het han theo doi, khong con canh
-                # bao gi them (khong phai la SL/TP that su, chi la het thoi
-                # gian bot theo doi).
-                self.bot.send_message(
-                    f"<b>{sym}</b> {direction.upper()} <b>HET HAN theo doi</b> sau "
-                    f"{self.cfg.signal_ttl_seconds}s tu luc vao, chua cham SL/TP "
-                    f"(gia hien tai {price:.6g}) - bot ngung theo doi kèo nay.")
-                append_jsonl(self.cfg.resolve_path(self.cfg.log_path), {
-                    "ts": now, "symbol": sym, "event": "signal_ttl_expired", "price": price,
-                })
                 expired.append(sym)
         for sym in expired:
             self.active_signals.pop(sym, None)
 
-    def _check_signal_health(self, results: List[dict]) -> None:
-        """Tinh nang MOI: moi vong quet, doi voi cac kèo dang active_signals,
-        neu symbol do nam trong ket qua quet vong nay (results), so lai
-        huong/veto MOI NHAT voi huong luc vao kèo. Neu tinh hinh xau di ro
-        ret VA LIEN TUC trong nhieu vong quet lien tiep (xem
-        signal_health_confirm_scans) thi BAO 1 LAN qua Telegram "tin hieu
-        xau - can nhac bo kèo". Neu van tot (cung huong, khong bi veto) thi
-        IM LANG - khong nhan tin gi ca, tranh spam.
+    def _fill_missing_prices(self, current_prices: Dict[str, float]) -> None:
+        """FIX bug 'bot im lang': bo sung gia cho cac symbol dang co active
+        signal nhung KHONG con nam trong scan_set cua vong quet nay (rot khoi
+        top volume, /coinstrong tat, het "nong"...).
 
-        FIX quan trong: truoc day chi 1 vong quet (~poll_seconds giay) thay
-        veto/dao chieu la bao ngay. Cac module vote (tape_flow,
-        taker_buy_sell_ratio, order_book_imbalance...) la du lieu ngan han,
-        rat de dao qua lai quanh nguong 0.05 trong vai chuc giay du thi
-        truong khong doi huong that su -> gan nhu kèo nao vua bao xong cung
-        dinh canh bao "xau di" ngay vong quet ke tiep, dung mot phan y het
-        du lieu vua dung de tao ra tin hieu do. Gio can nhieu vong quet LIEN
-        TIEP (mac dinh 3, ~signal_health_confirm_scans * poll_seconds giay)
-        deu cho ket qua xau (veto/dao chieu/neutral) moi tinh la "xau that",
-        chi 1 vong le te bi nhieu ngan han se KHONG lam tang canh bao.
-
-        Khong tu dong xoa kèo khoi active_signals hay huy SL/TP - nguoi dung
-        van tu quyet dinh (dung theo triet ly "KHONG DAT LENH" cua bot).
-        Neu sau khi bi canh bao ma tinh hinh hoi phuc tro lai (cung huong,
-        khong veto) thi am tham bo canh bao va reset chuoi xau (khong nhan
-        tin "da tot lai" de tranh spam 2 chieu, dung y "neu tot thi khong
-        noi gi het").
-
-        Chi re-check duoc cho symbol nao ro rang co mat trong scan set vong
-        nay (results) - alt coin nao rot khoi scan set (vd het hot, khong
-        con trong top volume) se khong duoc re-check vong do, van tiep tuc
-        theo doi SL/TP/TTL binh thuong o _check_hits_and_expiry. Nhung vong
-        bi bo qua nhu vay KHONG lam tang/giam bad_streak - chi dem cac vong
-        thuc su co du lieu moi.
-        """
-        if not self.cfg.enable_signal_health_alert:
+        Truoc day current_prices chi duoc build tu ket qua build_features()
+        cua scan_set hien tai; neu 1 symbol vua bat tin hieu xong roi bi loai
+        khoi scan_set o lan refresh universe tiep theo (moi UNIVERSE_REFRESH_
+        SECONDS giay), no se KHONG con trong current_prices -> trong
+        _check_hits_and_expiry(), dieu kien `if price is None: continue` se
+        bo qua symbol do VINH VIEN, ke ca phan kiem tra TTL het han - tin hieu
+        do bi "treo" mai mai, khong bao gio duoc bao TP/SL nua. Ham nay goi
+        rieng fetch_last_price() (nhe, weight=1, khong phu thuoc scan_set) cho
+        moi symbol con thieu de dam bao active_signals luon duoc theo doi."""
+        missing = [s for s in self.active_signals.keys() if s not in current_prices]
+        if not missing:
             return
-        confirm_needed = max(1, self.cfg.signal_health_confirm_scans)
-        fresh_by_symbol = {r["symbol"]: r for r in results}
-        for sym, sig in list(self.active_signals.items()):
-            fresh = fresh_by_symbol.get(sym)
-            if fresh is None:
-                continue
-            orig_dir = sig["direction"]
-            fresh_dir = fresh["direction"]
-            turned_bad = fresh.get("veto") or fresh_dir == "neutral" or fresh_dir != orig_dir
-            if turned_bad:
-                sig["bad_streak"] = sig.get("bad_streak", 0) + 1
-            else:
-                sig["bad_streak"] = 0
-            if (turned_bad and not sig.get("warned_bad")
-                    and sig["bad_streak"] >= confirm_needed):
-                reason = fresh.get("veto_reason") or "huong da dao chieu / khong con ro rang"
-                self.bot.send_message(
-                    f"⚠️ <b>{sym}</b> {orig_dir.upper()} - <b>TIN HIEU XAU DI</b>, can nhac bo kèo.\n"
-                    f"Luc vao: {orig_dir.upper()} | Quet lai vua roi: "
-                    f"{fresh_dir.upper() if fresh_dir != 'neutral' else 'NEUTRAL'} "
-                    f"(score={fresh.get('score', 0):.1f})\n"
-                    f"Ly do: {reason} (da xau lien tuc {sig['bad_streak']} vong quet)\n"
-                    f"(Bot van tiep tuc theo doi SL/TP nhu binh thuong, day chi la canh bao "
-                    f"tham khao - ban tu quyet dinh giu hay dong kèo.)")
-                append_jsonl(self.cfg.resolve_path(self.cfg.log_path), {
-                    "ts": time.time(), "symbol": sym, "event": "signal_turned_bad",
-                    "orig_direction": orig_dir, "fresh_direction": fresh_dir,
-                    "fresh_score": fresh.get("score", 0), "reason": reason,
-                    "bad_streak": sig["bad_streak"],
-                })
-                sig["warned_bad"] = True
-            elif not turned_bad and sig.get("warned_bad"):
-                # Hoi phuc tro lai - im lang bo canh bao, khong nhan tin gi them.
-                sig["warned_bad"] = False
+        with ThreadPoolExecutor(max_workers=min(len(missing), self.cfg.max_workers)) as pool:
+            futures = {pool.submit(fetch_last_price, s): s for s in missing}
+            for future in as_completed(futures):
+                sym = futures[future]
+                try:
+                    price = future.result()
+                except Exception:  # noqa: BLE001
+                    price = None
+                if price is not None:
+                    current_prices[sym] = price
 
     def _process_symbol(self, symbol: str, is_core: bool, is_ws: bool) -> Optional[dict]:
         """Chay trong 1 worker thread. Tra ve result dict hoac None neu loi.
@@ -583,12 +320,12 @@ class SignalEngine:
                     "direction": result["direction"], "entry_price": entry_price,
                     "entry_type": entry_info["entry_type"], "sl": sl, "tp": tp,
                     "created_at": now, "filled": entry_info["entry_type"] == "MARKET",
-                    "bad_streak": 0, "warned_bad": False,
                 }
 
+        # FIX: bo sung gia cho active signal da roi khoi scan_set truoc khi
+        # check TP/SL/het han (xem docstring _fill_missing_prices o tren).
+        self._fill_missing_prices(current_prices)
         self._check_hits_and_expiry(current_prices)
-        self._check_signal_health(results)
-        self._check_scan_updates()
 
         top5 = rank_top(results, 5)
         if top5:

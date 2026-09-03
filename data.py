@@ -597,6 +597,36 @@ def fetch_long_short_ratio(symbol: str, cache_ttl: float = 0.0) -> Optional[floa
     return val
 
 
+def fetch_last_price(symbol: str, cache_ttl: float = 0.0) -> Optional[float]:
+    """Gia hien tai, nhe (GET /fapi/v1/ticker/price, weight=1, khong keo theo
+    orderbook/funding/OI...). Dung RIENG de theo doi TP/SL cho cac symbol dang
+    co active signal nhung da roi khoi scan_set cua vong quet hien tai (rot
+    khoi top volume, /coinstrong tat, het "nong"...) va vi vay khong con duoc
+    build_features() cap nhat gia moi vong nua.
+
+    Truoc day thieu ham nay la nguyen nhan chinh khien bot 'im lang' voi
+    mot so tin hieu da bat: SignalEngine._check_hits_and_expiry() chi nhan
+    gia tu ket qua build_features() cua vong quet hien tai, symbol nao khong
+    con trong scan_set thi khong co gia -> bi bo qua vinh vien, khong bao
+    gio duoc bao TP/SL hay het han nua. Xem SignalEngine._fill_missing_prices
+    trong app.py."""
+    cache_key = f"lastpx:{symbol}"
+    if cache_ttl > 0:
+        cached = REST_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+    raw = safe_get(f"{FAPI}/fapi/v1/ticker/price", params={"symbol": symbol}, weight=1)
+    val = None
+    if raw:
+        try:
+            val = float(raw.get("price"))
+        except (TypeError, ValueError):
+            val = None
+    if cache_ttl > 0 and val is not None:
+        REST_CACHE.set(cache_key, val, cache_ttl)
+    return val
+
+
 def fetch_cross_exchange_price(exchange: str, symbol: str, timeout: float = 3.0) -> Optional[float]:
     """Best-effort, tra ve None neu loi (khong lam sap vong quet).
     Dung safe_get_external: KHONG di qua WEIGHT_LIMITER cua Binance."""
