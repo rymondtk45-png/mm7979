@@ -24,6 +24,16 @@ do lon = do tin cay module do. Composite = sum(module_score * weight), sau do ch
    pha khoi VAH/VAL -> nghieng breakout theo huong pha.
 4. classify_entry(): them dieu chinh nhe theo VPIN (do doc hai dong lenh) - VPIN
    cao -> uu tien LIMIT de tranh truot gia khi vao MARKET.
+5. FIX BUG CRASH "'float' object has no attribute 'get'": data.py HIEN TAI tra
+   ve f["open_interest"] la Optional[float] (gia tri OI tho), CHUA phai dict
+   {"value","pct_change","z"} nhu INTEGRATION_GUIDE.md mo ta. Vi key nay LUON
+   TON TAI trong dict f (data.py luon set no, du la None hay float), nen
+   f.get("open_interest", {}) khong bao gio tra ve {} mac dinh - no tra dung
+   cai float/None do, roi goi .get() len no -> crash. Da them guard
+   isinstance(..., dict) cho open_interest_trend, whale_retail_flow va
+   btc_regime_filter (3 module doc field dang dict tu f) de KHONG crash khi
+   data.py chua cung cap dung dinh dang - cac module nay se tra ve 0.0 (khong
+   co y kien) cho toi khi data.py duoc cap nhat dung "hop dong" du lieu.
 
 Cac field moi trong dict `f` (features) ma cac ham nay doc - can duoc `data.py`
 cung cap (xem INTEGRATION_GUIDE.md):
@@ -34,6 +44,10 @@ cung cap (xem INTEGRATION_GUIDE.md):
   f["funding_spread_cross"] = Optional[float]
   f["vpin"] = float  (0..1, cang cao cang "doc hai"/nhieu thong tin bat can xung)
   f["volume_profile"]["vah"], f["volume_profile"]["val"] = float (Value Area)
+
+  LUU Y (xem muc 5 o tren): open_interest_trend, whale_retail_flow va
+  btc_regime_filter se tu tra ve 0.0 mot cach an toan neu data.py chua cung
+  cap dung dinh dang dict o tren (thay vi crash ca vong quet symbol).
 """
 from __future__ import annotations
 
@@ -42,6 +56,17 @@ from typing import Dict, List, Tuple
 from config import AppConfig
 
 LEGACY_MODULES = ["volume_profile", "tape_flow", "liquidation_impulse", "funding_extreme"]
+
+
+def _as_dict(value) -> dict:
+    """
+    Helper an toan: tra ve `value` neu no la dict, nguoc lai tra ve {} rong.
+    Dung o moi cho doc field ma module DANG KY VONG la dict (open_interest,
+    whale_flow, btc_regime...) nhung data.py co the dang tra ve kieu khac
+    (float, None, chua co key...) - tranh crash 'X object has no attribute get'.
+    """
+    return value if isinstance(value, dict) else {}
+
 
 # --------------------------------------------------------------------------
 # Phan loai LIMIT vs MARKET theo BAN CHAT cua module dang dan dat tin hieu
@@ -312,8 +337,15 @@ def module_open_interest_trend(f: dict) -> float:
     khong phai dong tien moi.
     Can f["open_interest"]["pct_change"] va f["price_change_15m_pct"] (xem
     INTEGRATION_GUIDE.md de biet cach data.py cung cap 2 field nay).
+
+    FIX: data.py hien tai co the tra f["open_interest"] la float/None (chua
+    phai dict) - dung _as_dict() de tranh crash 'float' object has no
+    attribute 'get'; neu chua dung dinh dang, module tra ve 0.0 (bo qua,
+    khong co y kien) thay vi lam sap ca vong quet symbol.
     """
-    oi = f.get("open_interest", {})
+    oi = _as_dict(f.get("open_interest"))
+    if not oi:
+        return 0.0
     oi_pct = oi.get("pct_change", 0.0)
     price_pct = f.get("price_change_15m_pct", 0.0)
     if abs(oi_pct) < 0.005 or abs(price_pct) < 0.0005:
@@ -334,8 +366,13 @@ def module_whale_retail_flow(f: dict) -> float:
     Can f["whale_flow"] = {"whale_cvd", "retail_cvd", "whale_ratio"} (xem
     INTEGRATION_GUIDE.md - lay tu TradeTape dang co san, khong can data nguon
     moi).
+
+    FIX: dung _as_dict() de tranh crash neu data.py chua cung cap field nay
+    dung dinh dang dict - tra ve 0.0 an toan.
     """
-    wf = f.get("whale_flow", {})
+    wf = _as_dict(f.get("whale_flow"))
+    if not wf:
+        return 0.0
     whale_cvd = wf.get("whale_cvd", 0.0)
     retail_cvd = wf.get("retail_cvd", 0.0)
     whale_ratio = wf.get("whale_ratio", 0.0)
@@ -358,11 +395,16 @@ def module_btc_regime_filter(f: dict) -> float:
     dung cho chinh BTC/ETH (tu no la market leader).
     Can f["btc_regime"] = {"bias_1h", "bias_4h", "regime"} - tinh 1 lan/vong
     quet, dung chung cho moi symbol (xem INTEGRATION_GUIDE.md).
+
+    FIX: dung _as_dict() de tranh crash neu data.py chua cung cap field nay
+    dung dinh dang dict - tra ve 0.0 an toan.
     """
     symbol = f.get("symbol", "")
     if symbol.startswith("BTC") or symbol.startswith("ETH"):
         return 0.0
-    btc = f.get("btc_regime", {})
+    btc = _as_dict(f.get("btc_regime"))
+    if not btc:
+        return 0.0
     b1h, b4h, regime = btc.get("bias_1h"), btc.get("bias_4h"), btc.get("regime")
     if not b1h or not b4h:
         return 0.0

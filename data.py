@@ -5,6 +5,29 @@ gia tham chieu cross-exchange, tape, book, volume profile, liquidation,
 iceberg/spoof/absorption proxy, positioning, regime.
 
 Khong dat lenh. Chi doc du lieu public.
+
+=== THAY DOI SO VOI BAN GOC (fix tuong thich voi signals.py) ===
+signals.py (module_open_interest_trend, module_whale_retail_flow,
+module_btc_regime_filter) can 3 field dang dict trong f - nhung ban goc chi
+cung cap open_interest la float/None, khong co whale_flow/btc_regime gi ca.
+Da them:
+  1. MarketContext.oi_history + MarketContext.oi_features(): luu lich su OI
+     theo thoi gian (giong cach funding_zscore dang lam), tra ve dict
+     {"value","pct_change","z"} thay vi float tho.
+  2. TradeTape.whale_retail_flow(): tach CVD lenh lon (whale, theo cung nguong
+     USD voi large_print_cluster) khoi lenh nho (retail) tu chinh tape dang co
+     san - khong can nguon du lieu moi.
+  3. compute_btc_regime(): tinh bias 1h/4h + regime cua BTCUSDT 1 lan, dung
+     chung REST_CACHE (qua fetch_klines cache_ttl) nen KHONG ton them API call
+     khi da co BTCUSDT trong scan set (luon co, vi la CORE_SYMBOLS).
+  4. build_features() tra them "price_change_15m_pct" (alias cua
+     "price_move_pct_15m" cu - giu ca 2 ten de khong pha code dang dung ten cu)
+     vi signals.module_open_interest_trend doc dung ten "price_change_15m_pct".
+
+LUU Y KHI TICH HOP: f["open_interest"] gio la DICT (khong con la float/None
+nhu truoc). Neu app.py hoac cho nao khac dang doc f["open_interest"] nhu mot
+so de hien thi/log, can sua thanh f["open_interest"]["value"] - kiem tra lai
+app.py truoc khi deploy.
 """
 from __future__ import annotations
 
@@ -340,6 +363,24 @@ def classify_regime(klines_1h: List[dict]) -> str:
     if directional > 0.015:
         return "trending"
     return "accumulation"
+
+
+def compute_btc_regime(cfg: AppConfig) -> dict:
+    """
+    Bias 1h/4h + regime cua BTCUSDT, dung lam boi canh macro chung cho cac alt
+    khac (xem signals.module_btc_regime_filter). BTCUSDT luon nam trong
+    CORE_SYMBOLS nen build_features("BTCUSDT", ...) trong CUNG vong quet nay
+    (thuong chay truoc hoac song song) da goi fetch_klines voi cung cache_ttl
+    -> ket qua o day thuong lay thang tu REST_CACHE, KHONG ton them API call.
+    Neu vi ly do nao do BTCUSDT chua duoc fetch trong vong nay (vd universe
+    loi), ham nay se tu goi fetch_klines binh thuong (co WEIGHT_LIMITER bao ve).
+    """
+    klines_1h = fetch_klines("BTCUSDT", "1h", limit=30, cache_ttl=cfg.htf_1h_cache_seconds)
+    klines_4h = fetch_klines("BTCUSDT", "4h", limit=20, cache_ttl=cfg.htf_4h_cache_seconds)
+    bias_1h = bias_from_klines(klines_1h, 12)
+    bias_4h = bias_from_klines(klines_4h, 12)
+    regime = classify_regime(klines_1h)
+    return {"bias_1h": bias_1h, "bias_4h": bias_4h, "regime": regime}
 
 
 # --------------------------------------------------------------------------
@@ -771,6 +812,45 @@ class TradeTape:
             return {"cluster": True, "side": "short", "count": sell_count}
         return {"cluster": False, "side": None, "count": max(buy_count, sell_count)}
 
+    def whale_retail_flow(self, threshold_usd: float, window_seconds: int = 300) -> dict:
+        """
+        Tach CVD (theo qty, cung don vi voi cvd_1m/5m/15m) thanh 2 nhom trong
+        `window_seconds` gan nhat:
+          - whale: moi lenh co gia tri USD >= threshold_usd (dung chung nguong
+            voi large_print_cluster - MIN_LARGE_PRINT_USD - de nhat quan dinh
+            nghia "lenh lon" trong toan bot).
+          - retail: phan con lai.
+        whale_ratio = ty trong KHOI LUONG USD den tu nhom whale / tong khoi
+        luong USD trong window (dung de cac module giam do tin cay khi mau
+        whale qua nho).
+        Tra ve {"whale_cvd", "retail_cvd", "whale_ratio"}. Neu tape rong, tra
+        ve dict 0.0 (an toan, khong crash o phia goi).
+        """
+        with self._lock:
+            trades = list(self.trades)
+        if not trades:
+            return {"whale_cvd": 0.0, "retail_cvd": 0.0, "whale_ratio": 0.0}
+        now = trades[-1]["ts"]
+        cutoff = now - window_seconds * 1000
+        whale_cvd = 0.0
+        retail_cvd = 0.0
+        whale_usd = 0.0
+        total_usd = 0.0
+        for t in trades:
+            if t["ts"] < cutoff:
+                continue
+            qty = t["qty"]
+            usd = t["price"] * qty
+            signed_qty = -qty if t.get("isBuyerMaker") else qty
+            total_usd += usd
+            if usd >= threshold_usd:
+                whale_cvd += signed_qty
+                whale_usd += usd
+            else:
+                retail_cvd += signed_qty
+        whale_ratio = (whale_usd / total_usd) if total_usd > 0 else 0.0
+        return {"whale_cvd": whale_cvd, "retail_cvd": retail_cvd, "whale_ratio": whale_ratio}
+
 
 class LocalBook:
     """Sổ lệnh cục bộ cho 1 symbol tu WS depth20 hoac REST fallback."""
@@ -1020,6 +1100,7 @@ class MarketContext:
         self.books: Dict[str, LocalBook] = {}
         self.liq = LiquidationTape()
         self.funding_history: Dict[str, Deque[float]] = {}
+        self.oi_history: Dict[str, Deque[Tuple[float, float]]] = {}
         self.stream: Optional[StreamHub] = None
 
     def ensure_symbol(self, symbol: str) -> None:
@@ -1029,6 +1110,8 @@ class MarketContext:
             self.books[symbol] = LocalBook(self.cfg)
         if symbol not in self.funding_history:
             self.funding_history[symbol] = deque(maxlen=200)
+        if symbol not in self.oi_history:
+            self.oi_history[symbol] = deque(maxlen=200)
 
     def start_stream(self, ws_symbols: List[str]) -> None:
         for s in ws_symbols:
@@ -1049,6 +1132,52 @@ class MarketContext:
         if stdev == 0:
             return 0.0
         return (current - mean) / stdev
+
+    def oi_features(self, symbol: str, current: Optional[float]) -> dict:
+        """
+        Tra ve {"value","pct_change","z"} tu lich su OI luu (theo (ts, value)),
+        dung dinh dang ma signals.module_open_interest_trend can (xem
+        INTEGRATION_GUIDE.md).
+          - pct_change: so voi gia tri OI gan nhat cach >= 15 phut truoc (fallback
+            ve gia tri cu nhat con luu neu lich su chua du dai) - phan anh dung
+            tinh than "OI tang/giam trong 15 phut" ma module can, thay vi so
+            sanh giua 2 lan fetch lien tiep (co the chi cach nhau vai chuc giay).
+          - z: z-score cua gia tri hien tai so voi phan phoi cac gia tri da luu
+            (toi da 200 diem, ~ vai gio du lieu tuy chu ky quet).
+        Neu current la None (chua fetch OI vong nay, vd symbol khong thuoc
+        use_full), tra ve dict rong an toan - module se tu bo qua (return 0.0).
+        """
+        if current is None:
+            return {"value": None, "pct_change": 0.0, "z": 0.0}
+        hist = self.oi_history.setdefault(symbol, deque(maxlen=200))
+        now = time.time()
+        hist.append((now, current))
+
+        ref = None
+        for ts, val in hist:
+            if now - ts >= 900:  # >= 15 phut truoc
+                ref = val
+            else:
+                break
+        if ref is None and len(hist) > 1:
+            ref = hist[0][1]  # chua du 15 phut du lieu -> dung diem cu nhat co
+
+        pct_change = 0.0
+        if ref and ref != 0:
+            pct_change = (current - ref) / ref
+
+        values = [v for _, v in hist]
+        z = 0.0
+        if len(values) >= 5:
+            mean = statistics.mean(values)
+            try:
+                stdev = statistics.stdev(values)
+            except statistics.StatisticsError:
+                stdev = 0.0
+            if stdev:
+                z = (current - mean) / stdev
+
+        return {"value": current, "pct_change": pct_change, "z": z}
 
 
 def build_features(symbol: str, cfg: AppConfig, ctx: MarketContext, is_core: bool,
@@ -1080,6 +1209,16 @@ def build_features(symbol: str, cfg: AppConfig, ctx: MarketContext, is_core: boo
     sweep = detect_sweep(klines_15m, klines_1h)
     regime = classify_regime(klines_1h)
 
+    # btc_regime: boi canh macro chung cho toan bo alt (signals.module_btc_regime_filter).
+    # BTCUSDT tu tinh lai bias/regime cua chinh no o tren (bias_1h/bias_4h/regime)
+    # nen khong can goi lai qua compute_btc_regime(); cac symbol khac goi ham
+    # dung chung - se hit REST_CACHE (khong ton API call them) neu BTCUSDT da
+    # duoc build_features() trong cung vong quet.
+    if symbol == "BTCUSDT":
+        btc_regime = {"bias_1h": bias_1h, "bias_4h": bias_4h, "regime": regime}
+    else:
+        btc_regime = compute_btc_regime(cfg)
+
     tape = ctx.tapes[symbol]
     book = ctx.books[symbol]
 
@@ -1093,6 +1232,7 @@ def build_features(symbol: str, cfg: AppConfig, ctx: MarketContext, is_core: boo
         cvd_5m = tape.cvd_window(300)
         cvd_15m = tape.cvd_window(900)
         cluster = tape.large_print_cluster()
+        whale_flow = tape.whale_retail_flow(cfg.min_large_print_usd, window_seconds=300)
         if not book.bids or not book.asks:
             bids, asks = fetch_depth(symbol, cfg.depth_levels)
             book.update(bids, asks)
@@ -1106,6 +1246,9 @@ def build_features(symbol: str, cfg: AppConfig, ctx: MarketContext, is_core: boo
         cvd_5m = compute_cvd([t for t in trades if now_ms - t.get("ts", now_ms) <= 300_000])
         cvd_15m = compute_cvd(trades)
         cluster = {"cluster": False, "side": None, "count": 0}
+        # Khong co live tape day du (chi 1 lan REST snapshot) -> whale/retail
+        # split khong dang tin cay, tra ve 0.0 an toan thay vi tinh tren mau qua nho.
+        whale_flow = {"whale_cvd": 0.0, "retail_cvd": 0.0, "whale_ratio": 0.0}
         bids, asks = fetch_depth(symbol, cfg.depth_levels)
         imbalance = compute_imbalance(bids, asks, cfg.depth_levels)
         microprice = compute_microprice(bids[0][0], bids[0][1], asks[0][0], asks[0][1]) if bids and asks else 0.0
@@ -1139,9 +1282,14 @@ def build_features(symbol: str, cfg: AppConfig, ctx: MarketContext, is_core: boo
         premium = fetch_premium_index(symbol, cache_ttl=cfg.funding_cache_seconds)
         funding, mark_price, index_price = premium["funding"], premium["mark"], premium["index"]
 
-    open_interest = None
+    open_interest_raw = None
     if use_full:
-        open_interest = fetch_open_interest(symbol, cache_ttl=0 if is_core else cfg.oi_cache_seconds)
+        open_interest_raw = fetch_open_interest(symbol, cache_ttl=0 if is_core else cfg.oi_cache_seconds)
+    # open_interest: dict {"value","pct_change","z"} - dung dinh dang ma
+    # signals.module_open_interest_trend can (xem MarketContext.oi_features).
+    # Neu use_full=False (symbol khong duoc fetch OI vong nay), tra ve dict
+    # rong {"value": None, ...} - module se tu bo qua.
+    open_interest = ctx.oi_features(symbol, open_interest_raw)
 
     lsr = None
     if use_full:
@@ -1199,5 +1347,11 @@ def build_features(symbol: str, cfg: AppConfig, ctx: MarketContext, is_core: boo
         "basis": basis, "open_interest": open_interest,
         "long_short_ratio": lsr, "taker_buy_sell_ratio": taker_ratio,
         "cross_exchange_divergence": cross_divergence,
+        # Giu ca 2 ten field cho "price move 15m" de khong pha code cu dang
+        # dung "price_move_pct_15m" (vd app.py/log), dong thoi cung cap dung
+        # ten "price_change_15m_pct" ma signals.module_open_interest_trend can.
         "price_move_pct_15m": price_move_pct,
+        "price_change_15m_pct": price_move_pct,
+        "whale_flow": whale_flow,
+        "btc_regime": btc_regime,
     }
