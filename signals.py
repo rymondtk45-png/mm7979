@@ -401,6 +401,165 @@ def compute_composite(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dic
     }
 
 
+def compute_composite_scan(f: dict, weights: Dict[str, float], cfg: AppConfig) -> dict:
+    """
+    Bien the CHI DUNG CHO LENH /scan (khong dung trong vong lap alert chinh
+    run_once/compute_composite): bo qua veto HTF, veto "weak consensus"
+    (>=4 module + chenh lech phieu >=3) va veto "low evidence diversity"
+    (>=2/3 nhom momentum/structure/mean-reversion) de /scan LUON tra ve mot
+    huong entry co the xem, kem canh bao ro rang la huong nay chua qua het
+    lop bao ve cua he thong (giong composite chinh o cho khac).
+
+    FIX: ham nay bi mat khi signals.py duoc viet lai (compute_composite cu
+    thay bang logic gate moi: >=4 module/chenh lech >=3/da dang nhom) nhung
+    ban than compute_composite_scan lai chua duoc cap nhat theo -> app.py
+    import compute_composite_scan bi ImportError, container crash-loop.
+    Viet lai o day, dong bo voi gate/logic moi cua compute_composite.
+
+    Logic:
+    1) Van chay htf_check() nhu binh thuong nhung CHI DE GHI LAI ly do
+       (htf_bypassed=True neu bi veto o composite chinh).
+    2) Tinh cac module dang active (giong compute_composite) + tong co
+       trong so. Neu tong ro huong (>0 hoac <0) thi dung huong do. Neu
+       tong = 0, chon module co |raw*weight| lon nhat lam huong de xuat
+       (forced_by_strength=True).
+    3) Kiem tra 2 gate "weak consensus" va "low evidence diversity" NHUNG
+       chi de danh dau canh bao (mixed_votes=True), khong con return som/
+       veto nua - /scan van hien ket qua kem canh bao.
+    4) Diem so (score/confidence) tinh theo cung cong thuc active_weight
+       cua compute_composite; neu la huong bi "ep" theo module manh nhat
+       (forced_by_strength) thi nhan them he so giam (x0.6) de phan biet
+       voi tin hieu dong thuan day du.
+
+    Tra ve dict giong compute_composite + them:
+      htf_bypassed (bool): True neu htf_check() dang veto (conflict/align).
+      htf_reason (str): ly do tu htf_check(), du co bypass hay khong.
+      mixed_votes (bool): True neu gate "weak consensus" hoac "low
+        evidence diversity" le ra se veto o composite chinh.
+      forced_by_strength (bool): True neu huong duoc chon tu module manh
+        nhat vi tong co trong so = 0 (khong the suy huong tu tong).
+    """
+    reasons: List[str] = []
+
+    allowed, htf_reason = htf_check(f.get("bias_15m", "neutral"), f.get("bias_1h", "neutral"),
+                                     f.get("bias_4h", "neutral"), cfg)
+    htf_bypassed = not allowed
+    reasons.append(htf_reason if allowed else f"{htf_reason} (BO QUA rieng cho /scan)")
+
+    active_modules = LEGACY_MODULES if not cfg.enable_market_intel_scoring else list(weights.keys())
+
+    module_scores: Dict[str, float] = {}
+    total = 0.0
+    votes_long = 0
+    votes_short = 0
+
+    for name in active_modules:
+        if name not in weights:
+            continue
+        func = MODULE_FUNCS.get(name)
+        if not func:
+            continue
+        raw = func(f)
+        module_scores[name] = raw
+        w = weights[name]
+        total += raw * w
+        if raw > 0.05:
+            votes_long += 1
+        elif raw < -0.05:
+            votes_short += 1
+
+    total_votes = votes_long + votes_short
+    vote_diff = abs(votes_long - votes_short)
+    weak_consensus = total_votes < 4 or vote_diff < 3
+    if weak_consensus:
+        reasons.append(
+            f"canh bao: weak consensus (modules co y kien={total_votes}, chenh lech phieu={vote_diff}, "
+            f"can >=4 module VA chenh lech >=3) - /scan van hien theo module manh nhat")
+
+    if total > 0:
+        direction = "long"
+    elif total < 0:
+        direction = "short"
+    else:
+        direction = "neutral"
+
+    low_diversity = False
+    if direction != "neutral":
+        dir_sign = _dir_sign(direction)
+        categories_present = set()
+        for name, raw in module_scores.items():
+            if raw * dir_sign <= 0.05:
+                continue
+            if name in MOMENTUM_MODULES:
+                categories_present.add("momentum")
+            elif name in STRUCTURE_MODULES:
+                categories_present.add("structure")
+            elif name in MEANREV_MODULES:
+                categories_present.add("meanrev")
+        low_diversity = len(categories_present) < 2
+        if low_diversity:
+            cats_str = ",".join(sorted(categories_present)) if categories_present else "none"
+            reasons.append(
+                f"canh bao: dong thuan chi tap trung 1 nhom ban chat ({cats_str}) "
+                f"- can bang chung tu >=2/3 nhom (momentum/structure/mean-reversion)")
+
+    mixed_votes = weak_consensus or low_diversity
+
+    strongest_name = None
+    strongest_contrib = 0.0
+    for name, raw in module_scores.items():
+        contrib = raw * weights.get(name, 0.0)
+        if abs(contrib) > abs(strongest_contrib):
+            strongest_name, strongest_contrib = name, contrib
+
+    forced_by_strength = False
+    if direction == "neutral" and strongest_name and abs(strongest_contrib) > 1e-9:
+        direction = "long" if strongest_contrib > 0 else "short"
+        forced_by_strength = True
+        reasons.append(
+            f"khong co huong tong ro rang, dung module manh nhat '{strongest_name}' "
+            f"({strongest_contrib:+.3f}) -> nghieng {direction} (chi ap dung cho /scan)"
+        )
+
+    if direction != "neutral":
+        if f.get("bias_4h") != "neutral" and f.get("bias_4h") == direction:
+            total *= 1.15
+            reasons.append("4h aligned x1.15")
+
+        spoof_score = f.get("spoof_score", 0.0)
+        if spoof_score > 0.6:
+            total *= 0.75
+            reasons.append(f"spoof_score {spoof_score:.2f} > 0.6 -> x0.75")
+
+    active_weight = sum(
+        weights[name] for name, raw in module_scores.items() if abs(raw) > 0.05
+    )
+    magnitude = abs(total) / active_weight if active_weight else 0.0
+    if forced_by_strength and active_weight:
+        # tong bi trung hoa ve 0 nhung van co 1 module manh -> dung do lon
+        # cua module do lam proxy, giam bot (x0.6) vi day la tin hieu "mong"
+        # hon dong thuan that su (chi 1 module, khong phai tong hop nhieu module).
+        magnitude = min(abs(strongest_contrib) / active_weight, 1.0) * 0.6
+
+    score = max(0.0, min(100.0, magnitude * 100.0))
+    confidence = magnitude
+
+    if direction == "neutral":
+        reasons.append("khong co huong ro rang (ke ca module manh nhat cung = 0)")
+
+    top_modules = sorted(module_scores.items(), key=lambda kv: abs(kv[1]), reverse=True)[:4]
+    for name, val in top_modules:
+        if abs(val) > 0.05:
+            reasons.append(f"{name}: {'long' if val > 0 else 'short'} ({val:+.2f})")
+
+    return {
+        "score": score, "direction": direction, "confidence": confidence,
+        "reasons": reasons, "veto": False, "veto_reason": "", "module_scores": module_scores,
+        "htf_bypassed": htf_bypassed, "htf_reason": htf_reason,
+        "mixed_votes": mixed_votes, "forced_by_strength": forced_by_strength,
+    }
+
+
 def suggested_sl_tp(entry: float, direction: str, atr15m: float) -> Tuple[float, float]:
     """SL/TP tu ATR15m: SL = 0.8*ATR, TP = 1.5*ATR."""
     if direction == "long":
