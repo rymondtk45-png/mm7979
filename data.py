@@ -23,6 +23,10 @@ Da them:
   4. build_features() tra them "price_change_15m_pct" (alias cua
      "price_move_pct_15m" cu - giu ca 2 ten de khong pha code dang dung ten cu)
      vi signals.module_open_interest_trend doc dung ten "price_change_15m_pct".
+  5. fetch_cross_exchange_funding() + fetch_cross_exchange_funding_avg():
+     funding rate tu 5 san khac Binance (OKX/Bybit/BingX/KuCoin/Bitget/MEXC),
+     dung cho "funding_spread_cross_exchange" = funding lech giua Binance va
+     trung binh cac san khac (xem signals.module_funding_spread_cross_exchange).
 
 LUU Y KHI TICH HOP: f["open_interest"] gio la DICT (khong con la float/None
 nhu truoc). Neu app.py hoac cho nao khac dang doc f["open_interest"] nhu mot
@@ -64,6 +68,18 @@ CROSS_EXCHANGE_ENDPOINTS = {
     "KUCOIN": "https://api-futures.kucoin.com/api/v1/ticker?symbol={inst}",
     "BITGET": "https://api.bitget.com/api/v2/mix/market/ticker?symbol={sym}&productType=USDT-FUTURES",
     "MEXC": "https://contract.mexc.com/api/v1/contract/ticker?symbol={inst}",
+}
+
+# Funding rate hien tai, tach rieng khoi CROSS_EXCHANGE_ENDPOINTS (gia) vi khac
+# endpoint/response shape tren hau het cac san. Dung cho
+# fetch_cross_exchange_funding() / funding_spread_cross_exchange trong signals.py.
+CROSS_EXCHANGE_FUNDING_ENDPOINTS = {
+    "OKX": "https://www.okx.com/api/v5/public/funding-rate?instId={inst}",
+    "BYBIT": "https://api.bybit.com/v5/market/tickers?category=linear&symbol={sym}",
+    "BINGX": "https://open-api.bingx.com/openApi/swap/v2/quote/premiumIndex?symbol={inst}",
+    "KUCOIN": "https://api-futures.kucoin.com/api/v1/funding-rate/{inst}/current",
+    "BITGET": "https://api.bitget.com/api/v2/mix/market/current-fund-rate?symbol={sym}&productType=USDT-FUTURES",
+    "MEXC": "https://contract.mexc.com/api/v1/contract/funding_rate/{inst}",
 }
 
 
@@ -752,6 +768,105 @@ def fetch_cross_exchange_avg(symbol: str, cfg: AppConfig) -> Optional[float]:
     return avg
 
 
+def fetch_cross_exchange_funding(exchange: str, symbol: str, timeout: float = 3.0) -> Optional[float]:
+    """
+    Best-effort funding rate hien tai tu 1 san KHONG PHAI Binance, tra ve None
+    neu loi (khong lam sap vong quet). Dung safe_get_external: KHONG di qua
+    WEIGHT_LIMITER cua Binance, giong het tinh than fetch_cross_exchange_price().
+
+    Response shape khac nhau tren tung san (khac han endpoint gia):
+      OKX:    GET /public/funding-rate -> data[0].fundingRate (string)
+      BYBIT:  GET /market/tickers (CUNG endpoint voi gia) -> result.list[0].fundingRate
+      BINGX:  GET /quote/premiumIndex -> data.lastFundingRate
+      KUCOIN: GET /funding-rate/{symbol}/current -> data.value
+      BITGET: GET /current-fund-rate -> data[0].fundingRate
+      MEXC:   GET /contract/funding_rate/{symbol} -> data.fundingRate
+    """
+    base = symbol.replace("USDT", "")
+    try:
+        if exchange == "OKX":
+            url = CROSS_EXCHANGE_FUNDING_ENDPOINTS["OKX"].format(inst=f"{base}-USDT-SWAP")
+            r = safe_get_external(url, timeout=timeout)
+            data = r.get("data") if r else None
+            return float(data[0]["fundingRate"]) if data else None
+        if exchange == "BYBIT":
+            url = CROSS_EXCHANGE_FUNDING_ENDPOINTS["BYBIT"].format(sym=symbol)
+            r = safe_get_external(url, timeout=timeout)
+            lst = r["result"]["list"] if r and r.get("result") else []
+            return float(lst[0]["fundingRate"]) if lst else None
+        if exchange == "BINGX":
+            url = CROSS_EXCHANGE_FUNDING_ENDPOINTS["BINGX"].format(inst=f"{base}-USDT")
+            r = safe_get_external(url, timeout=timeout)
+            data = r.get("data") if r else None
+            return float(data["lastFundingRate"]) if data else None
+        if exchange == "KUCOIN":
+            url = CROSS_EXCHANGE_FUNDING_ENDPOINTS["KUCOIN"].format(inst=f"{base}USDTM")
+            r = safe_get_external(url, timeout=timeout)
+            data = r.get("data") if r else None
+            return float(data["value"]) if data and data.get("value") is not None else None
+        if exchange == "BITGET":
+            url = CROSS_EXCHANGE_FUNDING_ENDPOINTS["BITGET"].format(sym=symbol)
+            r = safe_get_external(url, timeout=timeout)
+            data = r.get("data") if r else None
+            if data and isinstance(data, list):
+                return float(data[0]["fundingRate"])
+            return None
+        if exchange == "MEXC":
+            url = CROSS_EXCHANGE_FUNDING_ENDPOINTS["MEXC"].format(inst=f"{base}_USDT")
+            r = safe_get_external(url, timeout=timeout)
+            data = r.get("data") if r else None
+            return float(data["fundingRate"]) if data else None
+    except Exception as e:  # noqa: BLE001
+        log.debug("cross-exchange funding %s %s loi: %s", exchange, symbol, e)
+        return None
+    return None
+
+
+def fetch_cross_exchange_funding_avg(symbol: str, cfg: AppConfig) -> Optional[float]:
+    """
+    Funding rate trung binh tu cac san khac Binance cho 1 symbol.
+
+    - Funding chi doi moi 8h tren hau het cac san (khac gia, di chuyen lien
+      tuc) -> cache LAU hon fetch_cross_exchange_avg (gia): mac dinh
+      max(cfg.cross_exchange_cache_seconds, 300) = it nhat 5 phut, tru khi
+      AppConfig co san field rieng 'funding_cross_exchange_cache_seconds' de
+      ban tinh chinh doc lap voi cache gia.
+    - Goi song song qua ThreadPoolExecutor giong fetch_cross_exchange_avg, 1
+      san loi/cham khong lam mat du lieu cua cac san con lai.
+    """
+    cache_key = f"crossfunding:{symbol}"
+    cached = REST_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    others = [ex for ex in cfg.exchanges if ex != "BINANCE"]
+    if not others:
+        return None
+
+    rates: List[float] = []
+    workers = max(min(cfg.cross_exchange_workers, len(others)), 1)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(fetch_cross_exchange_funding, ex, symbol, cfg.cross_exchange_timeout): ex
+            for ex in others
+        }
+        for fut in as_completed(futures):
+            ex = futures[fut]
+            try:
+                fr = fut.result()
+            except Exception as e:  # noqa: BLE001
+                log.debug("cross-exchange funding %s %s future loi: %s", ex, symbol, e)
+                continue
+            if fr is not None:
+                rates.append(fr)
+
+    avg = (sum(rates) / len(rates)) if rates else None
+    ttl = max(getattr(cfg, "funding_cross_exchange_cache_seconds", 0) or cfg.cross_exchange_cache_seconds, 300)
+    ttl_none = min(ttl, 60)  # loi/khong co du lieu -> retry som hon, khong cho het 5'+
+    REST_CACHE.set(cache_key, avg, ttl if avg is not None else ttl_none)
+    return avg
+
+
 # --------------------------------------------------------------------------
 # Realtime state: TradeTape / LocalBook / LiquidationTape
 # --------------------------------------------------------------------------
@@ -1310,6 +1425,7 @@ def build_features(symbol: str, cfg: AppConfig, ctx: MarketContext, is_core: boo
     # cache rieng (KHONG dung chung WEIGHT_LIMITER cua Binance), nen bat cho
     # ca tram cap van an toan cho toc do vong quet va cho ngan sach Binance.
     cross_divergence = 0.0
+    funding_spread_cross_exchange = 0.0
     if use_cross:
         if is_core:
             # CORE: khong cache, luon lay gia moi nhat tu 6 san.
@@ -1331,6 +1447,17 @@ def build_features(symbol: str, cfg: AppConfig, ctx: MarketContext, is_core: boo
         if avg_other and last_price:
             cross_divergence = (last_price - avg_other) / avg_other
 
+        # funding_spread_cross_exchange: dung chung dieu kien use_cross voi gia
+        # (khong tach rieng use_full) vi day cung la "boi canh lien san" giong
+        # cross_exchange_divergence, trong so 0.6 cung o muc thap tuong tu.
+        # Luon di qua fetch_cross_exchange_funding_avg (co cache rieng >= 5
+        # phut) du la CORE hay khong - KHAC voi gia (CORE luon fresh) vi
+        # funding von di chuyen rat cham, khong can fresh moi vong quet ngay
+        # ca voi CORE_SYMBOLS.
+        funding_avg_other = fetch_cross_exchange_funding_avg(symbol, cfg)
+        if funding_avg_other is not None and funding is not None:
+            funding_spread_cross_exchange = funding - funding_avg_other
+
     return {
         "symbol": symbol, "ts": now_ms, "is_core": is_core, "is_ws_tracked": is_ws_tracked,
         "last_price": last_price, "atr15m": atr15m, "atr4h": atr4h,
@@ -1347,6 +1474,7 @@ def build_features(symbol: str, cfg: AppConfig, ctx: MarketContext, is_core: boo
         "basis": basis, "open_interest": open_interest,
         "long_short_ratio": lsr, "taker_buy_sell_ratio": taker_ratio,
         "cross_exchange_divergence": cross_divergence,
+        "funding_spread_cross_exchange": funding_spread_cross_exchange,
         # Giu ca 2 ten field cho "price move 15m" de khong pha code cu dang
         # dung "price_move_pct_15m" (vd app.py/log), dong thoi cung cap dung
         # ten "price_change_15m_pct" ma signals.module_open_interest_trend can.
